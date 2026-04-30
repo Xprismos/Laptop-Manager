@@ -165,6 +165,7 @@ bot.onText(/\/start/, (msg) => {
 
 // ---------------- MESSAGE HANDLER ----------------
 bot.on("message", async (msg) => {
+    console.log("Received message:", msg.text);
   const text = (msg.text || "").trim();
   const chatId = msg.chat.id;
   const userId = msg.from.id;

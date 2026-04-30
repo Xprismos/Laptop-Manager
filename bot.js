@@ -401,8 +401,14 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   // ---------------- EXPERT LAPTOP PICK ----------------
-  if (data.startsWith("expert_pick_")) {
+if (data.startsWith("expert_pick_")) {
     const laptopId = parseInt(data.split("_")[2]);
+
+    const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+    if (existing) {
+      return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
+    }
+
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
     if (!laptop || laptop.status !== "available") {
@@ -960,7 +966,6 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 });
-
 
 // ---------------- KEEP ALIVE SERVER ----------------
 const http = require("http");

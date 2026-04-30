@@ -25,6 +25,15 @@ async function initDB() {
     )
   `);
 
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id INTEGER PRIMARY KEY,
+      username TEXT,
+      first_name TEXT,
+      group_type TEXT
+    )
+  `);
+
   const count = database.prepare(`SELECT COUNT(*) as count FROM laptops`).get();
 
   if (count.count === 0) {

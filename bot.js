@@ -1,3 +1,4 @@
+
 const TelegramBot = require("node-telegram-bot-api");
 const { initDB, db } = require("./database");
 require("dotenv").config();
@@ -9,7 +10,7 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 
 const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 5448140589, 1217462895, 912497121, 8526365759];
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049];
 
 const pendingChecks = {};
 const adminState = {};
@@ -77,6 +78,19 @@ async function sendAdminPanel(targetId) {
 async function notifyNeedsStart(chatId, username) {
   await bot.sendMessage(chatId,
     `⚠️ ${username}, you need to message the bot privately first. Open @YourBotUsername and press Start, then try again.`
+  );
+}
+
+// ---------------- TRACK USER ----------------
+async function trackUser(userId, username, firstName, groupType) {
+  await db().run(
+    `INSERT INTO users (user_id, username, first_name, group_type)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       username = excluded.username,
+       first_name = excluded.first_name,
+       group_type = excluded.group_type`,
+    [userId, username || null, firstName || null, groupType]
   );
 }
 
@@ -165,14 +179,19 @@ bot.onText(/\/start/, (msg) => {
 
 // ---------------- MESSAGE HANDLER ----------------
 bot.on("message", async (msg) => {
-    console.log("Received message:", msg.text);
   const text = (msg.text || "").trim();
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const lower = text.toLowerCase();
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+  const firstName = msg.from.first_name || "";
   const isAdmin = ADMIN_IDS.includes(userId);
   const groupType = getGroupType(chatId);
+
+  // Track all group users
+  if (msg.chat.type !== "private" && groupType) {
+    await trackUser(userId, msg.from.username || null, firstName, groupType);
+  }
 
   // Block private messages from normal users
   if (msg.chat.type === "private" && !isAdmin) {
@@ -194,18 +213,58 @@ bot.on("message", async (msg) => {
   }
 
   // ---------------- ADMIN TEXT INPUT ----------------
-  if (adminState[userId] && adminState[userId].action === "awaiting_laptop_name") {
+  if (adminState[userId]) {
     if (!isAdmin) return;
 
-const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
-if (reserved.includes(lower)) return;
+    const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
+    if (reserved.includes(lower)) return;
 
-    const laptopName = text;
-    delete adminState[userId];
-    await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
-    await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
-    await sendAdminPanel(userId);
-    return;
+    // Awaiting laptop name
+    if (adminState[userId].action === "awaiting_laptop_name") {
+      const laptopName = text;
+      delete adminState[userId];
+      await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
+      await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
+      await sendAdminPanel(userId);
+      return;
+    }
+
+    // Awaiting manual username for force assign
+    if (adminState[userId].action === "awaiting_fa_username") {
+      const inputRaw = text.replace(/^@/, "").toLowerCase();
+
+      const foundUser = await db().get(
+        `SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(first_name) = ?`,
+        [inputRaw, inputRaw]
+      );
+
+      if (!foundUser) {
+        await bot.sendMessage(userId, `⚠️ No user found with username or name "${text}". Make sure they've sent a message in the group, and check the spelling.`);
+        return;
+      }
+
+      adminState[userId] = { action: "force_assign_select_laptop", targetUserId: foundUser.user_id, targetUsername: foundUser.username ? `@${foundUser.username}` : foundUser.first_name, userGroupType: foundUser.group_type };
+
+      const laptops = await db().all(
+        `SELECT * FROM laptops WHERE status = 'available' OR status = 'stasis'`
+      );
+
+      if (!laptops.length) {
+        await bot.sendMessage(userId, "📭 No laptops available to assign.");
+        delete adminState[userId];
+        return sendAdminPanel(userId);
+      }
+
+      const buttons = laptops.map(l => ([{
+        text: `${l.name} (${l.status} - ${l.group_type})`,
+        callback_data: `fa_laptop_${l.id}`
+      }]));
+      buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
+
+      return bot.sendMessage(userId, `🖥 Select a laptop to assign to ${adminState[userId].targetUsername}:`, {
+        reply_markup: { inline_keyboard: buttons }
+      });
+    }
   }
 
   // ---------------- /admin ----------------
@@ -239,7 +298,6 @@ if (reserved.includes(lower)) return;
         );
 
         if (!expertLaptops.length) {
-
           return bot.sendMessage(chatId, "⏳ No expert laptops available. Please try again later.");
         }
 
@@ -402,7 +460,7 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   // ---------------- EXPERT LAPTOP PICK ----------------
-if (data.startsWith("expert_pick_")) {
+  if (data.startsWith("expert_pick_")) {
     const laptopId = parseInt(data.split("_")[2]);
 
     const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
@@ -488,12 +546,12 @@ if (data.startsWith("expert_pick_")) {
   if (!isAdmin) return;
 
   // ---------------- CANCEL ----------------
+  const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
+
   if (data === "cancel") {
     delete adminState[userId];
     return sendAdminPanel(userId);
   }
-
-  const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
 
   // ---------------- ADD LAPTOP ----------------
   if (data === "add_laptop") {
@@ -799,23 +857,32 @@ if (data.startsWith("expert_pick_")) {
 
   // ---------------- FORCE ASSIGN ----------------
   if (data === "force_assign") {
-    const normalQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
-    const expertQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
-    const allQueue = [...normalQueue, ...expertQueue];
+    const knownUsers = await db().all(`SELECT * FROM users ORDER BY username ASC`);
 
-    if (!allQueue.length) {
-      await bot.sendMessage(userId, "📭 Queue is empty.");
-      return sendAdminPanel(userId);
+    const buttons = [];
+
+    if (knownUsers.length) {
+      for (const u of knownUsers) {
+        const label = u.username ? `@${u.username}` : u.first_name;
+        buttons.push([{
+          text: label,
+          callback_data: `fa_user_${u.user_id}_${u.group_type}`
+        }]);
+      }
     }
 
-    const buttons = allQueue.map(q => ([{
-      text: `${q.username || `User ${q.user_id}`} (${q.group_type})`,
-      callback_data: `fa_user_${q.user_id}_${q.group_type}`
-    }]));
+    buttons.push([{ text: "✏️ Enter Username Manually", callback_data: "fa_manual" }]);
     buttons.push(cancelButton);
 
-    return bot.sendMessage(userId, "⚡ Select a user from the queue:", {
+    return bot.sendMessage(userId, "⚡ Select a user to force assign:", {
       reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
+  if (data === "fa_manual") {
+    adminState[userId] = { action: "awaiting_fa_username" };
+    return bot.sendMessage(userId, "✏️ Type the username or first name of the user (with or without @):", {
+      reply_markup: { inline_keyboard: [cancelButton] }
     });
   }
 
@@ -824,7 +891,10 @@ if (data.startsWith("expert_pick_")) {
     const targetUserId = parseInt(parts[2]);
     const userGroupType = parts[3];
 
-    adminState[userId] = { action: "force_assign_select_laptop", targetUserId, userGroupType };
+    const targetUser = await db().get(`SELECT * FROM users WHERE user_id = ?`, [targetUserId]);
+    const targetUsername = targetUser ? (targetUser.username ? `@${targetUser.username}` : targetUser.first_name) : `User ${targetUserId}`;
+
+    adminState[userId] = { action: "force_assign_select_laptop", targetUserId, targetUsername, userGroupType };
 
     const laptops = await db().all(
       `SELECT * FROM laptops WHERE status = 'available' OR status = 'stasis'`
@@ -832,6 +902,7 @@ if (data.startsWith("expert_pick_")) {
 
     if (!laptops.length) {
       await bot.sendMessage(userId, "📭 No laptops available to assign.");
+      delete adminState[userId];
       return sendAdminPanel(userId);
     }
 
@@ -841,7 +912,7 @@ if (data.startsWith("expert_pick_")) {
     }]));
     buttons.push(cancelButton);
 
-    return bot.sendMessage(userId, "🖥 Select a laptop to assign:", {
+    return bot.sendMessage(userId, `🖥 Select a laptop to assign to ${targetUsername}:`, {
       reply_markup: { inline_keyboard: buttons }
     });
   }
@@ -853,23 +924,39 @@ if (data.startsWith("expert_pick_")) {
       return bot.sendMessage(userId, "⚠️ Session expired. Try again.");
     }
 
-    const { targetUserId, userGroupType } = adminState[userId];
+    const { targetUserId, targetUsername, userGroupType } = adminState[userId];
     delete adminState[userId];
 
-    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
-    const queueUser = await db().get(`SELECT * FROM queue WHERE user_id = ?`, [targetUserId]);
-    const targetUsername = queueUser ? queueUser.username : `User ${targetUserId}`;
-    const targetGroupId = userGroupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+ const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-    await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
-    await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, group_type = ? WHERE id = ?`,
-      [targetUserId, targetUsername, userGroupType, laptopId]
-    );
+// Check if user already has a laptop
+const existingLaptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [targetUserId]);
+if (existingLaptop) {
+  const oldGroupId = existingLaptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+  await db().run(
+    `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
+    [existingLaptop.id]
+  );
+  await bot.sendMessage(oldGroupId,
+    `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`
+  );
+  const queueCount = await db().get(
+    `SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]
+  );
+  if (queueCount.count > 0) {
+    await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
+  }
+}
 
-    await bot.sendMessage(targetGroupId, `⚡ ${targetUsername} has been assigned to ${laptop.name}`);
-    await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
-    return sendAdminPanel(userId);
+await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
+await db().run(
+  `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, group_type = ? WHERE id = ?`,
+  [targetUserId, targetUsername, userGroupType, laptopId]
+);
+
+await bot.sendMessage(GROUP_CHAT_ID, `⚡ ${targetUsername} has been assigned to ${laptop.name}`);
+await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
+return sendAdminPanel(userId);
   }
 
   // ---------------- DELETE LAPTOP ----------------
@@ -896,7 +983,7 @@ if (data.startsWith("expert_pick_")) {
     const laptopId = parseInt(data.split("_")[1]);
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-    if(!laptop) {
+    if (!laptop) {
       await bot.sendMessage(userId, "⚠️ Laptop not found.");
       return sendAdminPanel(userId);
     }
@@ -955,7 +1042,6 @@ if (data.startsWith("expert_pick_")) {
 
     msg += "\n📋 Queue (Normal):\n";
     msg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
-
 
     msg += "\n📦 In Stasis:\n";
     msg += stasis.length ? stasis.map(l => `• ${l.name}`).join("\n") + "\n" : "None\n";

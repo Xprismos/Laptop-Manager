@@ -960,24 +960,40 @@ return sendAdminPanel(userId);
   }
 
   // ---------------- DELETE LAPTOP ----------------
+  
   if (data === "delete_laptop") {
-    const laptops = await db().all(`SELECT * FROM laptops`);
-
-    if (!laptops.length) {
-      await bot.sendMessage(userId, "📭 No laptops found.");
-      return sendAdminPanel(userId);
+  return bot.sendMessage(userId, "🗑 Delete — filter by status:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📦 Stasis", callback_data: "deletelist_stasis" }],
+        [{ text: "✅ Available", callback_data: "deletelist_available" }],
+        [{ text: "💻 Assigned", callback_data: "deletelist_assigned" }],
+        [{ text: "🔌 Offline", callback_data: "deletelist_offline" }],
+        cancelButton
+      ]
     }
+  });
+}
 
-    const buttons = laptops.map(l => ([{
-      text: `🗑 ${l.name} (${l.status} - ${l.group_type})`,
-      callback_data: `confirmdelete_${l.id}`
-    }]));
-    buttons.push(cancelButton);
+if (data.startsWith("deletelist_")) {
+  const status = data.split("_")[1];
+  const laptops = await db().all(`SELECT * FROM laptops WHERE status = ?`, [status]);
 
-    return bot.sendMessage(userId, "Select a laptop to delete:", {
-      reply_markup: { inline_keyboard: buttons }
-    });
+  if (!laptops.length) {
+    await bot.sendMessage(userId, `📭 No laptops with status: ${status}.`);
+    return sendAdminPanel(userId);
   }
+
+  const buttons = laptops.map(l => ([{
+    text: `🗑 ${l.name} (${l.group_type})`,
+    callback_data: `confirmdelete_${l.id}`
+  }]));
+  buttons.push(cancelButton);
+
+  return bot.sendMessage(userId, `Select a laptop to delete:`, {
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
 
   if (data.startsWith("confirmdelete_")) {
     const laptopId = parseInt(data.split("_")[1]);
@@ -1015,7 +1031,6 @@ return sendAdminPanel(userId);
     await bot.sendMessage(userId, `✅ ${laptop.name} has been deleted.`);
     return sendAdminPanel(userId);
   }
-
   // ---------------- STATUS ----------------
   if (data === "status") {
     const normalAssigned = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'normal'`);

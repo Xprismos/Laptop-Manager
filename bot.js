@@ -1,4 +1,5 @@
 
+
 const TelegramBot = require("node-telegram-bot-api");
 const { initDB, db } = require("./database");
 require("dotenv").config();
@@ -212,61 +213,54 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // ---------------- ADMIN TEXT INPUT ----------------
-  if (adminState[userId]) {
-    if (!isAdmin) return;
+// ---------------- ADMIN TEXT INPUT ----------------
+if (adminState[userId]) {
+  if (!isAdmin) return;
 
-    const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
-    if (reserved.includes(lower)) return;
+  const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
+  if (reserved.includes(lower)) return;
 
-    // Awaiting laptop name
-    if (adminState[userId].action === "awaiting_laptop_name") {
-      const laptopName = text;
-      delete adminState[userId];
-      await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
-      await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
-      await sendAdminPanel(userId);
+  // Awaiting laptop name
+  if (adminState[userId].action === "awaiting_laptop_name") {
+    const laptopName = text;
+    delete adminState[userId];
+    await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
+    await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
+    await sendAdminPanel(userId);
+    return;
+  }
+
+  // Awaiting search query for force assign
+  if (adminState[userId].action === "awaiting_fa_search") {
+    const query = text.replace(/^@/, "").toLowerCase();
+
+    const results = await db().all(
+      `SELECT * FROM users WHERE LOWER(username) LIKE ? OR LOWER(first_name) LIKE ?`,
+      [`%${query}%`, `%${query}%`]
+    );
+
+    if (!results.length) {
+      await bot.sendMessage(userId, `⚠️ No users found matching "${text}". Try again.`);
       return;
     }
 
-    // Awaiting manual username for force assign
-    if (adminState[userId].action === "awaiting_fa_username") {
-      const inputRaw = text.replace(/^@/, "").toLowerCase();
+    const buttons = results.map(u => {
+      const label = u.username ? `@${u.username}` : u.first_name;
+      return [{
+        text: label,
+        callback_data: `fa_user_${u.user_id}_${u.group_type}`
+      }];
+    });
+    buttons.push([{ text: "🔍 Search Again", callback_data: "force_assign" }]);
+    buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
 
-      const foundUser = await db().get(
-        `SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(first_name) = ?`,
-        [inputRaw, inputRaw]
-      );
+    delete adminState[userId];
 
-      if (!foundUser) {
-        await bot.sendMessage(userId, `⚠️ No user found with username or name "${text}". Make sure they've sent a message in the group, and check the spelling.`);
-        return;
-      }
-
-      adminState[userId] = { action: "force_assign_select_laptop", targetUserId: foundUser.user_id, targetUsername: foundUser.username ? `@${foundUser.username}` : foundUser.first_name, userGroupType: foundUser.group_type };
-
-      const laptops = await db().all(
-        `SELECT * FROM laptops WHERE status = 'available' OR status = 'stasis'`
-      );
-
-      if (!laptops.length) {
-        await bot.sendMessage(userId, "📭 No laptops available to assign.");
-        delete adminState[userId];
-        return sendAdminPanel(userId);
-      }
-
-      const buttons = laptops.map(l => ([{
-        text: `${l.name} (${l.status} - ${l.group_type})`,
-        callback_data: `fa_laptop_${l.id}`
-      }]));
-      buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
-
-      return bot.sendMessage(userId, `🖥 Select a laptop to assign to ${adminState[userId].targetUsername}:`, {
-        reply_markup: { inline_keyboard: buttons }
-      });
-    }
+    return bot.sendMessage(userId, `Select a user:`, {
+      reply_markup: { inline_keyboard: buttons }
+    });
   }
-
+}
   // ---------------- /admin ----------------
   if (text === "/admin" && isAdmin) {
     try {
@@ -856,28 +850,12 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   // ---------------- FORCE ASSIGN ----------------
-  if (data === "force_assign") {
-    const knownUsers = await db().all(`SELECT * FROM users ORDER BY username ASC`);
-
-    const buttons = [];
-
-    if (knownUsers.length) {
-      for (const u of knownUsers) {
-        const label = u.username ? `@${u.username}` : u.first_name;
-        buttons.push([{
-          text: label,
-          callback_data: `fa_user_${u.user_id}_${u.group_type}`
-        }]);
-      }
-    }
-
-    buttons.push([{ text: "✏️ Enter Username Manually", callback_data: "fa_manual" }]);
-    buttons.push(cancelButton);
-
-    return bot.sendMessage(userId, "⚡ Select a user to force assign:", {
-      reply_markup: { inline_keyboard: buttons }
-    });
-  }
+if (data === "force_assign") {
+  adminState[userId] = { action: "awaiting_fa_search" };
+  return bot.sendMessage(userId, "🔍 Type a name or username to search:", {
+    reply_markup: { inline_keyboard: [cancelButton] }
+  });
+}
 
   if (data === "fa_manual") {
     adminState[userId] = { action: "awaiting_fa_username" };
@@ -960,7 +938,7 @@ return sendAdminPanel(userId);
   }
 
   // ---------------- DELETE LAPTOP ----------------
-  
+
   if (data === "delete_laptop") {
   return bot.sendMessage(userId, "🗑 Delete — filter by status:", {
     reply_markup: {
@@ -1031,6 +1009,7 @@ if (data.startsWith("deletelist_")) {
     await bot.sendMessage(userId, `✅ ${laptop.name} has been deleted.`);
     return sendAdminPanel(userId);
   }
+
   // ---------------- STATUS ----------------
   if (data === "status") {
     const normalAssigned = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'normal'`);
@@ -1068,6 +1047,7 @@ if (data.startsWith("deletelist_")) {
     return sendAdminPanel(userId);
   }
 });
+
 
 // ---------------- KEEP ALIVE SERVER ----------------
 const http = require("http");

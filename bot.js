@@ -1020,28 +1020,28 @@ if (data.startsWith("deletelist_")) {
     const stasis = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
     const offline = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
 
-    let msg = "📊 STATUS\n\n";
+ let msg = "📊 STATUS\n\n";
 
     msg += "💻 In Use (Normal):\n";
-    msg += normalAssigned.length ? normalAssigned.map(l => `• ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
+    msg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
 
     msg += "\n💻 In Use (Expert):\n";
-    msg += expertAssigned.length ? expertAssigned.map(l => `• ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
+    msg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
 
     msg += "\n✅ Available (Normal):\n";
-    msg += normalAvailable.length ? normalAvailable.map(l => `• ${l.name}`).join("\n") + "\n" : "None\n";
+    msg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
     msg += "\n✅ Available (Expert):\n";
-    msg += expertAvailable.length ? expertAvailable.map(l => `• ${l.name}`).join("\n") + "\n" : "None\n";
+    msg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
     msg += "\n📋 Queue (Normal):\n";
     msg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
 
     msg += "\n📦 In Stasis:\n";
-    msg += stasis.length ? stasis.map(l => `• ${l.name}`).join("\n") + "\n" : "None\n";
+    msg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
     msg += "\n🔌 Offline:\n";
-    msg += offline.length ? offline.map(l => `• ${l.name}`).join("\n") + "\n" : "None\n";
+    msg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
     await bot.sendMessage(userId, msg);
     return sendAdminPanel(userId);

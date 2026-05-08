@@ -6,7 +6,7 @@ async function initDB() {
   database = new Database("./bot.db");
 
   database.exec(`
-    CREATE TABLE IF NOT EXISTS laptops (
+    CREATE TABLE IF NOT EXISTS laptops ( 
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT,
       status TEXT DEFAULT 'stasis',
@@ -15,6 +15,14 @@ async function initDB() {
       assigned_username TEXT
     )
   `);
+
+
+  try {
+    database.exec(`
+      ALTER TABLE laptops ADD COLUMN assigned_at TEXT `);
+  } catch (e) {
+    console.error("Error adding column:", e);
+  }
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS queue (

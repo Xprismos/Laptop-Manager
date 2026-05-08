@@ -56,7 +56,9 @@ function getGroupType(chatId) {
 }
 
 function getAssignedAt() {
-  return new Date().toLocaleString('en-US', {
+  const now = new Date();
+  now.setHours(now.getHours() + 1);
+  return now.toLocaleString('en-US', {
     weekday: 'short',
     hour: '2-digit',
     minute: '2-digit',

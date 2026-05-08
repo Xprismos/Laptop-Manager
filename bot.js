@@ -55,6 +55,15 @@ function getGroupType(chatId) {
   return null;
 }
 
+function getAssignedAt() {
+  return new Date().toLocaleString('en-US', {
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+}
+
 async function sendAdminPanel(targetId) {
   try {
     await bot.sendMessage(targetId, "🛠 Admin Panel", {
@@ -213,54 +222,55 @@ bot.on("message", async (msg) => {
     return;
   }
 
-// ---------------- ADMIN TEXT INPUT ----------------
-if (adminState[userId]) {
-  if (!isAdmin) return;
+  // ---------------- ADMIN TEXT INPUT ----------------
+  if (adminState[userId]) {
+    if (!isAdmin) return;
 
-  const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
-  if (reserved.includes(lower)) return;
+    const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
+    if (reserved.includes(lower)) return;
 
-  // Awaiting laptop name
-  if (adminState[userId].action === "awaiting_laptop_name") {
-    const laptopName = text;
-    delete adminState[userId];
-    await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
-    await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
-    await sendAdminPanel(userId);
-    return;
-  }
-
-  // Awaiting search query for force assign
-  if (adminState[userId].action === "awaiting_fa_search") {
-    const query = text.replace(/^@/, "").toLowerCase();
-
-    const results = await db().all(
-      `SELECT * FROM users WHERE LOWER(username) LIKE ? OR LOWER(first_name) LIKE ?`,
-      [`%${query}%`, `%${query}%`]
-    );
-
-    if (!results.length) {
-      await bot.sendMessage(userId, `⚠️ No users found matching "${text}". Try again.`);
+    // Awaiting laptop name
+    if (adminState[userId].action === "awaiting_laptop_name") {
+      const laptopName = text;
+      delete adminState[userId];
+      await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
+      await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
+      await sendAdminPanel(userId);
       return;
     }
 
-    const buttons = results.map(u => {
-      const label = u.username ? `@${u.username}` : u.first_name;
-      return [{
-        text: label,
-        callback_data: `fa_user_${u.user_id}_${u.group_type}`
-      }];
-    });
-    buttons.push([{ text: "🔍 Search Again", callback_data: "force_assign" }]);
-    buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
+    // Awaiting search query for force assign
+    if (adminState[userId].action === "awaiting_fa_search") {
+      const query = text.replace(/^@/, "").toLowerCase();
 
-    delete adminState[userId];
+      const results = await db().all(
+        `SELECT * FROM users WHERE LOWER(username) LIKE ? OR LOWER(first_name) LIKE ?`,
+        [`%${query}%`, `%${query}%`]
+      );
 
-    return bot.sendMessage(userId, `Select a user:`, {
-      reply_markup: { inline_keyboard: buttons }
-    });
+      if (!results.length) {
+        await bot.sendMessage(userId, `⚠️ No users found matching "${text}". Try again.`);
+        return;
+      }
+
+      const buttons = results.map(u => {
+        const label = u.username ? `@${u.username}` : u.first_name;
+        return [{
+          text: label,
+          callback_data: `fa_user_${u.user_id}_${u.group_type}`
+        }];
+      });
+      buttons.push([{ text: "🔍 Search Again", callback_data: "force_assign" }]);
+      buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
+
+      delete adminState[userId];
+
+      return bot.sendMessage(userId, `Select a user:`, {
+        reply_markup: { inline_keyboard: buttons }
+      });
+    }
   }
-}
+
   // ---------------- /admin ----------------
   if (text === "/admin" && isAdmin) {
     try {
@@ -327,7 +337,7 @@ if (adminState[userId]) {
         if (!laptop) return bot.sendMessage(chatId, "❌ You don't have an expert laptop.");
 
         await db().run(
-          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
+          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
           [laptop.id]
         );
 
@@ -376,9 +386,10 @@ if (adminState[userId]) {
           return bot.sendMessage(chatId, "⏳ No laptops available. You've been added to queue.");
         }
 
+        const now = getAssignedAt();
         await db().run(
-          `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ? WHERE id = ?`,
-          [userId, username, laptop.id]
+          `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
+          [userId, username, now, laptop.id]
         );
 
         return bot.sendMessage(chatId, `✅ ${username} has been assigned: ${laptop.name}`);
@@ -397,7 +408,7 @@ if (adminState[userId]) {
         if (!laptop) return bot.sendMessage(chatId, "❌ You don't have a laptop.");
 
         await db().run(
-          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
+          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
           [laptop.id]
         );
 
@@ -468,9 +479,10 @@ bot.on("callback_query", async (callbackQuery) => {
       return bot.sendMessage(chatId, "⚠️ That laptop is no longer available.");
     }
 
+    const now = getAssignedAt();
     await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ? WHERE id = ?`,
-      [userId, username, laptopId]
+      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
+      [userId, username, now, laptopId]
     );
 
     return bot.sendMessage(EXPERT_GROUP_CHAT_ID, `✅ ${username} is working on: ${laptop.name}`);
@@ -501,9 +513,10 @@ bot.on("callback_query", async (callbackQuery) => {
     }
 
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
+    const now = getAssignedAt();
     await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ? WHERE id = ?`,
-      [userId, username, laptopId]
+      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
+      [userId, username, now, laptopId]
     );
 
     const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
@@ -646,7 +659,7 @@ bot.on("callback_query", async (callbackQuery) => {
     }
 
     await db().run(
-      `UPDATE laptops SET status = 'stasis', group_type = 'stasis', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
+      `UPDATE laptops SET status = 'stasis', group_type = 'stasis', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
       [laptopId]
     );
 
@@ -701,7 +714,7 @@ bot.on("callback_query", async (callbackQuery) => {
     }
 
     await db().run(
-      `UPDATE laptops SET status = 'offline', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
+      `UPDATE laptops SET status = 'offline', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
       [laptopId]
     );
 
@@ -850,12 +863,39 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   // ---------------- FORCE ASSIGN ----------------
-if (data === "force_assign") {
-  adminState[userId] = { action: "awaiting_fa_search" };
-  return bot.sendMessage(userId, "🔍 Type a name or username to search:", {
-    reply_markup: { inline_keyboard: [cancelButton] }
-  });
-}
+  if (data === "force_assign") {
+    adminState[userId] = { action: "awaiting_fa_search" };
+    return bot.sendMessage(userId, "🔍 Type a name or username to search for a user:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📋 Pick from Queue", callback_data: "force_assign_queue" }],
+          cancelButton
+        ]
+      }
+    });
+  }
+
+  // Pick from queue fallback
+  if (data === "force_assign_queue") {
+    const normalQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
+    const expertQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
+    const allQueue = [...normalQueue, ...expertQueue];
+
+    if (!allQueue.length) {
+      await bot.sendMessage(userId, "📭 Queue is empty.");
+      return sendAdminPanel(userId);
+    }
+
+    const buttons = allQueue.map(q => ([{
+      text: `${q.username || `User ${q.user_id}`} (${q.group_type})`,
+      callback_data: `fa_user_${q.user_id}_${q.group_type}`
+    }]));
+    buttons.push(cancelButton);
+
+    return bot.sendMessage(userId, "⚡ Select a user from the queue:", {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
 
   if (data === "fa_manual") {
     adminState[userId] = { action: "awaiting_fa_username" };
@@ -869,8 +909,12 @@ if (data === "force_assign") {
     const targetUserId = parseInt(parts[2]);
     const userGroupType = parts[3];
 
+    // Try to get display name from users table first, then queue
     const targetUser = await db().get(`SELECT * FROM users WHERE user_id = ?`, [targetUserId]);
-    const targetUsername = targetUser ? (targetUser.username ? `@${targetUser.username}` : targetUser.first_name) : `User ${targetUserId}`;
+    const queueUser = await db().get(`SELECT * FROM queue WHERE user_id = ?`, [targetUserId]);
+    const targetUsername = targetUser
+      ? (targetUser.username ? `@${targetUser.username}` : targetUser.first_name)
+      : (queueUser ? queueUser.username : `User ${targetUserId}`);
 
     adminState[userId] = { action: "force_assign_select_laptop", targetUserId, targetUsername, userGroupType };
 
@@ -905,73 +949,77 @@ if (data === "force_assign") {
     const { targetUserId, targetUsername, userGroupType } = adminState[userId];
     delete adminState[userId];
 
- const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-// Check if user already has a laptop
-const existingLaptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [targetUserId]);
-if (existingLaptop) {
-  const oldGroupId = existingLaptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
-  await db().run(
-    `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL WHERE id = ?`,
-    [existingLaptop.id]
-  );
-  await bot.sendMessage(oldGroupId,
-    `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`
-  );
-  const queueCount = await db().get(
-    `SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]
-  );
-  if (queueCount.count > 0) {
-    await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
-  }
-}
-
-await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
-await db().run(
-  `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, group_type = ? WHERE id = ?`,
-  [targetUserId, targetUsername, userGroupType, laptopId]
-);
-
-await bot.sendMessage(GROUP_CHAT_ID, `⚡ ${targetUsername} has been assigned to ${laptop.name}`);
-await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
-return sendAdminPanel(userId);
-  }
-
-  // ---------------- DELETE LAPTOP ----------------
-
-  if (data === "delete_laptop") {
-  return bot.sendMessage(userId, "🗑 Delete — filter by status:", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📦 Stasis", callback_data: "deletelist_stasis" }],
-        [{ text: "✅ Available", callback_data: "deletelist_available" }],
-        [{ text: "💻 Assigned", callback_data: "deletelist_assigned" }],
-        [{ text: "🔌 Offline", callback_data: "deletelist_offline" }],
-        cancelButton
-      ]
+    // Check if user already has a laptop and unassign it first
+    const existingLaptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [targetUserId]);
+    if (existingLaptop) {
+      const oldGroupId = existingLaptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+      await db().run(
+        `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
+        [existingLaptop.id]
+      );
+      await bot.sendMessage(oldGroupId,
+        `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`
+      );
+      const queueCount = await db().get(
+        `SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]
+      );
+      if (queueCount.count > 0) {
+        await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
+      }
     }
-  });
-}
 
-if (data.startsWith("deletelist_")) {
-  const status = data.split("_")[1];
-  const laptops = await db().all(`SELECT * FROM laptops WHERE status = ?`, [status]);
+    await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
+    const now = getAssignedAt();
+    await db().run(
+      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, group_type = ?, assigned_at = ? WHERE id = ?`,
+      [targetUserId, targetUsername, userGroupType, now, laptopId]
+    );
 
-  if (!laptops.length) {
-    await bot.sendMessage(userId, `📭 No laptops with status: ${status}.`);
+    const targetGroupId = userGroupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+    await bot.sendMessage(targetGroupId, `⚡ ${targetUsername} has been assigned to ${laptop.name}`);
+    await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
     return sendAdminPanel(userId);
   }
 
-  const buttons = laptops.map(l => ([{
-    text: `🗑 ${l.name} (${l.group_type})`,
-    callback_data: `confirmdelete_${l.id}`
-  }]));
-  buttons.push(cancelButton);
+  // ---------------- DELETE LAPTOP ----------------
+  if (data === "delete_laptop") {
+    return bot.sendMessage(userId, "🗑 Delete — filter by status:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📦 Stasis", callback_data: "deletelist_stasis" }],
+          [{ text: "✅ Available", callback_data: "deletelist_available" }],
+          [{ text: "💻 Assigned", callback_data: "deletelist_assigned" }],
+          [{ text: "🔌 Offline", callback_data: "deletelist_offline" }],
+          [{ text: "🗂 All", callback_data: "deletelist_all" }],
+          cancelButton
+        ]
+      }
+    });
+  }
 
-  return bot.sendMessage(userId, `Select a laptop to delete:`, {
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
+  if (data.startsWith("deletelist_")) {
+    const statusFilter = data.split("_")[1];
+    const laptops = statusFilter === "all"
+      ? await db().all(`SELECT * FROM laptops`)
+      : await db().all(`SELECT * FROM laptops WHERE status = ?`, [statusFilter]);
+
+    if (!laptops.length) {
+      await bot.sendMessage(userId, `📭 No laptops${statusFilter !== "all" ? ` with status: ${statusFilter}` : ""}.`);
+      return sendAdminPanel(userId);
+    }
+
+    const buttons = laptops.map(l => ([{
+      text: `🗑 ${l.name} (${l.status} - ${l.group_type})`,
+      callback_data: `confirmdelete_${l.id}`
+    }]));
+    buttons.push(cancelButton);
+
+    return bot.sendMessage(userId, `Select a laptop to delete:`, {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
 
   if (data.startsWith("confirmdelete_")) {
     const laptopId = parseInt(data.split("_")[1]);
@@ -1017,16 +1065,17 @@ if (data.startsWith("deletelist_")) {
     const normalAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal'`);
     const expertAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`);
     const normalQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
+    const expertQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
     const stasis = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
     const offline = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
 
- let msg = "📊 STATUS\n\n";
+    let msg = "📊 STATUS\n\n";
 
     msg += "💻 In Use (Normal):\n";
-    msg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
+    msg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || 'unknown'})`).join("\n") + "\n" : "None\n";
 
     msg += "\n💻 In Use (Expert):\n";
-    msg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`}`).join("\n") + "\n" : "None\n";
+    msg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || 'unknown'})`).join("\n") + "\n" : "None\n";
 
     msg += "\n✅ Available (Normal):\n";
     msg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
@@ -1036,6 +1085,9 @@ if (data.startsWith("deletelist_")) {
 
     msg += "\n📋 Queue (Normal):\n";
     msg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
+
+    msg += "\n📋 Queue (Expert):\n";
+    msg += expertQueue.length ? expertQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
 
     msg += "\n📦 In Stasis:\n";
     msg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
@@ -1047,7 +1099,6 @@ if (data.startsWith("deletelist_")) {
     return sendAdminPanel(userId);
   }
 });
-
 
 // ---------------- KEEP ALIVE SERVER ----------------
 const http = require("http");

@@ -9,7 +9,7 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 
 const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 5448140589];
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759];
 
 const pendingChecks = {};
 const adminState = {};
@@ -1413,6 +1413,4 @@ bot.on("polling_error", (err) => {
 
 process.on("unhandledRejection", (err) => {
   console.log("Unhandled rejection:", err.message);
-});
-e.log("Unhandled rejection:", err.message);
 });

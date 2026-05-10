@@ -375,8 +375,8 @@ bot.on("message", async (msg) => {
       const query = text.toLowerCase().trim();
       delete adminState[userId];
       const laptops = await db().all(
-        `SELECT * FROM laptops WHERE LOWER(name) LIKE ?`,
-        [`%${query}%`]
+`SELECT * FROM laptops WHERE (LOWER(name) LIKE ? OR LOWER(REPLACE(REPLACE(name, '⭐', ''), '★', '')) LIKE ?)`,
+[`%${query}%`, `%${query}%`]
       );
       if (!laptops.length) {
         await bot.sendMessage(userId, `⚠️ No laptops found matching "${text}".`);
@@ -397,8 +397,8 @@ bot.on("message", async (msg) => {
       delete adminState[userId];
 
       const laptops = await db().all(
-        `SELECT * FROM laptops WHERE advanced_security = 1 AND LOWER(name) LIKE ?`,
-        [`%${query}%`]
+`SELECT * FROM laptops WHERE advanced_security = 1 AND (LOWER(name) LIKE ? OR LOWER(REPLACE(REPLACE(name, '⭐', ''), '★', '')) LIKE ?)`,
+[`%${query}%`, `%${query}%`]
       );
 
       if (!laptops.length) {

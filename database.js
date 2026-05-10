@@ -5,6 +5,20 @@ let database;
 async function initDB() {
   database = new Database("./bot.db");
 
+
+
+    database.exec(`
+  CREATE TABLE IF NOT EXISTS laptop_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    laptop_id INTEGER,
+    laptop_name TEXT,
+    user_id INTEGER,
+    username TEXT,
+    action TEXT,
+    action_time TEXT
+  )
+`);
+
   database.exec(`
     CREATE TABLE IF NOT EXISTS laptops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +63,8 @@ async function initDB() {
       group_type TEXT
     )
   `);
+
+
 
   const count = database.prepare(`SELECT COUNT(*) as count FROM laptops`).get();
 

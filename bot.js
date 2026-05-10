@@ -21,7 +21,6 @@ const adminState = {};
 
 // ─── RELAY CALLBACKS ────────────────────────────────────────────────────────
 
-
 function escapeMarkdown(text) {
   return (text || "").replace(/[_*[\]()~`>#+=|{}.!-]/g, "\\$&");
 }
@@ -38,7 +37,6 @@ relay.onAgentConnect = async (rustdesk_id, password) => {
     [rustdesk_id, password, now]
   );
 
-  // If this rustdesk_id is already linked to a laptop, mark it connected
   await db().run(
     `UPDATE laptops SET agent_connected = 1 WHERE rustdesk_id = ?`,
     [rustdesk_id]
@@ -104,9 +102,9 @@ function getAssignedAt() {
 }
 
 function generatePassword() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
   let password = "";
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 7; i++) {
     password += chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return password;
@@ -162,19 +160,15 @@ async function sendPasswordDM(userId, laptopName, rustdesk_id, password, groupCh
 async function assignLaptopToUser(laptop, userId, username, groupChatId) {
   const now = getAssignedAt();
 
-  // Standard assignment
   await db().run(
     `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
     [userId, username, now, laptop.id]
   );
 
-  // If advanced security is enabled on this laptop
   if (laptop.advanced_security && laptop.rustdesk_id) {
-    // Check agent is actually connected
     if (!relay.isConnected(laptop.rustdesk_id)) {
-      // Warn in group, still assigned but no secure credentials
       await bot.sendMessage(groupChatId,
-        `⚠️ ${username} has been assigned *${laptop.name}* but there seems to be a disconnection with this laptop's security agent. Please let an admin handle this.`,
+        `⚠️ ${username} has been assigned *${escapeMarkdown(laptop.name)}* but there seems to be a disconnection with this laptop's security agent. Please let an admin handle this.`,
         { parse_mode: "Markdown" }
       );
       return;
@@ -183,10 +177,8 @@ async function assignLaptopToUser(laptop, userId, username, groupChatId) {
     try {
       const newPassword = generatePassword();
 
-      // Push new password to laptop
       await relay.setPassword(laptop.rustdesk_id, newPassword);
 
-      // Save new password in DB
       await db().run(
         `UPDATE laptops SET rustdesk_password = ? WHERE id = ?`,
         [newPassword, laptop.id]
@@ -196,13 +188,11 @@ async function assignLaptopToUser(laptop, userId, username, groupChatId) {
         [newPassword, laptop.rustdesk_id]
       );
 
-      // Notify group (no credentials in group)
       await bot.sendMessage(groupChatId,
         `✅ ${username} has been assigned: *${escapeMarkdown(laptop.name)}*\n🔐 Credentials sent via DM.`,
         { parse_mode: "Markdown" }
       );
 
-      // DM the user with credentials
       await sendPasswordDM(userId, laptop.name, laptop.rustdesk_id, newPassword, groupChatId);
 
     } catch (err) {
@@ -214,7 +204,6 @@ async function assignLaptopToUser(laptop, userId, username, groupChatId) {
     }
 
   } else {
-    // Standard assignment message (no RustDesk credentials)
     await bot.sendMessage(groupChatId, `✅ ${username} has been assigned: ${laptop.name}`);
   }
 }
@@ -377,12 +366,33 @@ bot.on("message", async (msg) => {
       const laptopName = text;
       delete adminState[userId];
       await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
-      await bot.sendMessage(userId, `✅ ${escapeMarkdownlaptopName} added to stasis.`);
+      await bot.sendMessage(userId, `✅ ${escapeMarkdown(laptopName)} added to stasis.`);
       await sendAdminPanel(userId);
       return;
     }
 
-if (adminState[userId].action === "awaiting_password_search") {
+    if (adminState[userId].action === "awaiting_delete_search") {
+      const query = text.toLowerCase().trim();
+      delete adminState[userId];
+      const laptops = await db().all(
+        `SELECT * FROM laptops WHERE LOWER(name) LIKE ?`,
+        [`%${query}%`]
+      );
+      if (!laptops.length) {
+        await bot.sendMessage(userId, `⚠️ No laptops found matching "${text}".`);
+        return sendAdminPanel(userId);
+      }
+      const buttons = laptops.map(l => ([{
+        text: `🗑 ${l.name} (${l.status} - ${l.group_type})`,
+        callback_data: `confirmdelete_${l.id}`
+      }]));
+      buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
+      return bot.sendMessage(userId, `Select a laptop to delete:`, {
+        reply_markup: { inline_keyboard: buttons }
+      });
+    }
+
+    if (adminState[userId].action === "awaiting_password_search") {
       const query = text.toLowerCase().trim();
       delete adminState[userId];
 
@@ -400,7 +410,7 @@ if (adminState[userId].action === "awaiting_password_search") {
       for (const l of laptops) {
         const online = l.rustdesk_id && relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
         const status = l.agent_connected ? "online" : "offline";
-        msg += `${online} *${l.name}*\n`;
+        msg += `${online} *${escapeMarkdown(l.name)}*\n`;
         msg += `     ID: \`${l.rustdesk_id || "not linked"}\`\n`;
         msg += `     Password: \`${l.rustdesk_password || "unknown"}\`\n`;
         msg += `     Status: ${status}\n\n`;
@@ -409,7 +419,6 @@ if (adminState[userId].action === "awaiting_password_search") {
       await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
       return sendAdminPanel(userId);
     }
-
 
     if (adminState[userId].action === "awaiting_fa_search") {
       const query = text.replace(/^@/, "").toLowerCase();
@@ -438,13 +447,11 @@ if (adminState[userId].action === "awaiting_password_search") {
       });
     }
 
-    // Awaiting laptop name for security link
     if (adminState[userId].action === "awaiting_security_name") {
       const { rustdesk_id } = adminState[userId];
       const laptopName = text.trim();
       delete adminState[userId];
 
-      // Find laptop by name
       const laptop = await db().get(`SELECT * FROM laptops WHERE LOWER(name) = LOWER(?)`, [laptopName]);
       if (!laptop) {
         await bot.sendMessage(userId,
@@ -454,7 +461,6 @@ if (adminState[userId].action === "awaiting_password_search") {
         return;
       }
 
-      // Link agent to laptop
       await db().run(
         `UPDATE laptops SET rustdesk_id = ?, agent_connected = 1 WHERE id = ?`,
         [rustdesk_id, laptop.id]
@@ -465,7 +471,7 @@ if (adminState[userId].action === "awaiting_password_search") {
       );
 
       await bot.sendMessage(userId,
-        `✅ Agent \`${rustdesk_id}\` linked to *${laptop.name}*.\n\nNow activate advanced security for this laptop from the Security menu.`,
+        `✅ Agent \`${rustdesk_id}\` linked to *${escapeMarkdown(laptop.name)}*.\n\nNow activate advanced security for this laptop from the Security menu.`,
         { parse_mode: "Markdown" }
       );
       await sendAdminPanel(userId);
@@ -1089,9 +1095,17 @@ bot.on("callback_query", async (callbackQuery) => {
           [{ text: "💻 Assigned", callback_data: "deletelist_assigned" }],
           [{ text: "🔌 Offline", callback_data: "deletelist_offline" }],
           [{ text: "🗂 All", callback_data: "deletelist_all" }],
+          [{ text: "🔍 Search by Name", callback_data: "deletelist_search" }],
           cancelButton
         ]
       }
+    });
+  }
+
+  if (data === "deletelist_search") {
+    adminState[userId] = { action: "awaiting_delete_search" };
+    return bot.sendMessage(userId, "🔍 Type the laptop name to search:", {
+      reply_markup: { inline_keyboard: [cancelButton] }
     });
   }
 
@@ -1158,34 +1172,26 @@ bot.on("callback_query", async (callbackQuery) => {
     const expertAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'expert'`);
     const normalAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal'`);
     const expertAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`);
-    const normalQueue     = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
-    const expertQueue     = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
     const stasis          = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
     const offline         = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
 
-    let statusMsg = "📊 STATUS\n\n";
+    let statusMsg = "📊 LAPTOP STATUS\n\n";
 
-    statusMsg += "💻 In Use (Normal):\n";
+    statusMsg += "💻 Normal — Assigned:\n";
     statusMsg += normalAssigned.length
-      ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || "unknown"})`).join("\n") + "\n"
+      ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${l.assigned_at || ""})`).join("\n") + "\n"
       : "None\n";
 
-    statusMsg += "\n💻 In Use (Expert):\n";
+    statusMsg += "\n💻 Expert — Assigned:\n";
     statusMsg += expertAssigned.length
-      ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || "unknown"})`).join("\n") + "\n"
+      ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${l.assigned_at || ""})`).join("\n") + "\n"
       : "None\n";
 
-    statusMsg += "\n✅ Available (Normal):\n";
+    statusMsg += "\n✅ Normal — Available:\n";
     statusMsg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    statusMsg += "\n✅ Available (Expert):\n";
+    statusMsg += "\n✅ Expert — Available:\n";
     statusMsg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
-
-    statusMsg += "\n📋 Queue (Normal):\n";
-    statusMsg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
-
-    statusMsg += "\n📋 Queue (Expert):\n";
-    statusMsg += expertQueue.length ? expertQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
 
     statusMsg += "\n📦 In Stasis:\n";
     statusMsg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
@@ -1201,7 +1207,7 @@ bot.on("callback_query", async (callbackQuery) => {
   // 🔐 SECURITY MENU
   // ════════════════════════════════════════════════
 
-if (data === "security_menu") {
+  if (data === "security_menu") {
     return bot.sendMessage(userId, "🔐 Security Panel:", {
       reply_markup: {
         inline_keyboard: [
@@ -1215,9 +1221,8 @@ if (data === "security_menu") {
       }
     });
   }
-  // ── LIVE AGENT STATUS ──
 
-if (data === "sec_password_search") {
+  if (data === "sec_password_search") {
     adminState[userId] = { action: "awaiting_password_search" };
     return bot.sendMessage(userId, "🔍 Type the laptop name to search:", {
       reply_markup: { inline_keyboard: [cancelButton] }
@@ -1238,8 +1243,8 @@ if (data === "sec_password_search") {
       msg += "🟢 Connected Agents:\n";
       for (const agent of connectedAgents) {
         const laptop = await db().get(`SELECT * FROM laptops WHERE rustdesk_id = ?`, [agent.rustdesk_id]);
-        const laptopLabel = laptop ? laptop.name : "⚠️ Not linked to a laptop";
-        msg += `• ID: \`${agent.rustdesk_id}\`\n  Laptop: ${escapeMarkdown(laptopLabel)}\n  Password: \`${agent.password}\`\n\n`;
+        const laptopLabel = laptop ? escapeMarkdown(laptop.name) : "⚠️ Not linked to a laptop";
+        msg += `• ID: \`${agent.rustdesk_id}\`\n  Laptop: ${laptopLabel}\n  Password: \`${agent.password}\`\n\n`;
       }
     }
 
@@ -1247,7 +1252,7 @@ if (data === "sec_password_search") {
     if (offlineSecure.length) {
       msg += "🔴 Offline (Advanced Security laptops not connected):\n";
       for (const l of offlineSecure) {
-        msg += `• ${l.name} (ID: \`${l.rustdesk_id || "unknown"}\`)\n`;
+        msg += `• ${escapeMarkdown(l.name)} (ID: \`${l.rustdesk_id || "unknown"}\`)\n`;
       }
     }
 
@@ -1282,7 +1287,6 @@ if (data === "sec_password_search") {
       });
     }
 
-    // Show unlinked agents (not yet assigned to a laptop)
     const buttons = [];
     for (const agent of connectedAgents) {
       const existingLink = await db().get(`SELECT name FROM laptops WHERE rustdesk_id = ?`, [agent.rustdesk_id]);
@@ -1313,7 +1317,6 @@ if (data === "sec_password_search") {
 
   // ── ACTIVATE ADVANCED SECURITY ──
   if (data === "sec_activate") {
-    // Show laptops that have an agent linked but security not yet active
     const laptops = await db().all(
       `SELECT * FROM laptops WHERE rustdesk_id IS NOT NULL AND advanced_security = 0`
     );
@@ -1343,7 +1346,6 @@ if (data === "sec_password_search") {
       return sendAdminPanel(userId);
     }
 
-    // Send handshake to confirm agent is alive
     await bot.sendMessage(userId, `🤝 Sending handshake to ${laptop.name}...`);
 
     if (!relay.isConnected(laptop.rustdesk_id)) {
@@ -1411,4 +1413,6 @@ bot.on("polling_error", (err) => {
 
 process.on("unhandledRejection", (err) => {
   console.log("Unhandled rejection:", err.message);
+});
+e.log("Unhandled rejection:", err.message);
 });

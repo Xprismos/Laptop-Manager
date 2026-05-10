@@ -930,12 +930,12 @@ bot.on("callback_query", async (callbackQuery) => {
     return bot.sendMessage(userId, "🔍 Type a laptop name to search:", { reply_markup: { inline_keyboard: [cancelButton] } });
   }
 
-  if (data.startsWith("showpw_")) {
+if (data.startsWith("showpw_")) {
     const laptopId = parseInt(data.replace("showpw_", ""));
     const l = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
     const online = l.rustdesk_id && relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
-    const msg = `${online} *${escapeMarkdown(l.name)}*\nID: \`${l.rustdesk_id || "not linked"}\`\nPassword: \`${l.rustdesk_password || "unknown"}\``;
-    await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+    const msg = `${online} ${l.name}\nID: ${l.rustdesk_id || "not linked"}\nPassword: ${l.rustdesk_password || "unknown"}`;
+    await bot.sendMessage(userId, msg);
     return sendAdminPanel(userId);
   }
 

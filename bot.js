@@ -1,17 +1,15 @@
-
-
 const TelegramBot = require("node-telegram-bot-api");
 const { initDB, db } = require("./database");
+const relay = require("./relay");
 require("dotenv").config();
 
 const TOKEN = process.env.TOKEN;
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-
 const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147];
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 5448140589];
 
 const pendingChecks = {};
 const adminState = {};
@@ -21,7 +19,45 @@ const adminState = {};
   console.log("🤖 Bot running");
 })();
 
-// ---------------- KEYBOARDS ----------------
+// ─── RELAY CALLBACKS ────────────────────────────────────────────────────────
+
+
+function escapeMarkdown(text) {
+  return (text || "").replace(/[_*[\]()~`>#+=|{}.!-]/g, "\\$&");
+}
+
+// When an agent connects for the first time, upsert into agents table
+relay.onAgentConnect = async (rustdesk_id, password) => {
+  const now = new Date().toISOString();
+  await db().run(
+    `INSERT INTO agents (rustdesk_id, rustdesk_password, last_seen)
+     VALUES (?, ?, ?)
+     ON CONFLICT(rustdesk_id) DO UPDATE SET
+       rustdesk_password = excluded.rustdesk_password,
+       last_seen = excluded.last_seen`,
+    [rustdesk_id, password, now]
+  );
+
+  // If this rustdesk_id is already linked to a laptop, mark it connected
+  await db().run(
+    `UPDATE laptops SET agent_connected = 1 WHERE rustdesk_id = ?`,
+    [rustdesk_id]
+  );
+
+  console.log(`✅ Agent registered in DB: ${rustdesk_id}`);
+};
+
+// When an agent disconnects, mark laptop as disconnected
+relay.onAgentDisconnect = async (rustdesk_id) => {
+  await db().run(
+    `UPDATE laptops SET agent_connected = 0 WHERE rustdesk_id = ?`,
+    [rustdesk_id]
+  );
+  console.log(`🔌 Agent marked offline in DB: ${rustdesk_id}`);
+};
+
+// ─── KEYBOARDS ──────────────────────────────────────────────────────────────
+
 const normalKeyboard = {
   reply_markup: {
     keyboard: [
@@ -48,7 +84,8 @@ const expertKeyboard = {
   }
 };
 
-// ---------------- HELPERS ----------------
+// ─── HELPERS ────────────────────────────────────────────────────────────────
+
 function getGroupType(chatId) {
   if (chatId === EXPERT_GROUP_CHAT_ID) return "expert";
   if (chatId === GROUP_CHAT_ID) return "normal";
@@ -58,12 +95,21 @@ function getGroupType(chatId) {
 function getAssignedAt() {
   const now = new Date();
   now.setHours(now.getHours() + 1);
-  return now.toLocaleString('en-US', {
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
+  return now.toLocaleString("en-US", {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
     hour12: true
   });
+}
+
+function generatePassword() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let password = "";
+  for (let i = 0; i < 10; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return password;
 }
 
 async function sendAdminPanel(targetId) {
@@ -78,7 +124,8 @@ async function sendAdminPanel(targetId) {
           [{ text: "🔄 Transfer", callback_data: "transfer_menu" }],
           [{ text: "⚡ Force Assign", callback_data: "force_assign" }],
           [{ text: "🗑 Delete Laptop", callback_data: "delete_laptop" }],
-          [{ text: "📊 Status", callback_data: "status" }]
+          [{ text: "📊 Status", callback_data: "status" }],
+          [{ text: "🔐 Security", callback_data: "security_menu" }]
         ]
       }
     });
@@ -93,7 +140,113 @@ async function notifyNeedsStart(chatId, username) {
   );
 }
 
-// ---------------- TRACK USER ----------------
+// Send RustDesk credentials to user via DM
+async function sendPasswordDM(userId, laptopName, rustdesk_id, password, groupChatId) {
+  try {
+    await bot.sendMessage(userId,
+      `🖥 You have been assigned: *${escapeMarkdown(laptopName)}*\n\n` +
+      `🔑 RustDesk ID: \`${rustdesk_id}\`\n` +
+      `🔐 Password: \`${password}\`\n\n` +
+      `Use these to connect via RustDesk. Return the laptop when done.`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (e) {
+    console.log("Could not DM user:", e.message);
+    await bot.sendMessage(groupChatId,
+      `⚠️ Could not send you the RustDesk credentials via DM. Please start the bot privately first.`
+    );
+  }
+}
+
+// Core assignment logic with advanced security support
+async function assignLaptopToUser(laptop, userId, username, groupChatId) {
+  const now = getAssignedAt();
+
+  // Standard assignment
+  await db().run(
+    `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
+    [userId, username, now, laptop.id]
+  );
+
+  // If advanced security is enabled on this laptop
+  if (laptop.advanced_security && laptop.rustdesk_id) {
+    // Check agent is actually connected
+    if (!relay.isConnected(laptop.rustdesk_id)) {
+      // Warn in group, still assigned but no secure credentials
+      await bot.sendMessage(groupChatId,
+        `⚠️ ${username} has been assigned *${laptop.name}* but there seems to be a disconnection with this laptop's security agent. Please let an admin handle this.`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    try {
+      const newPassword = generatePassword();
+
+      // Push new password to laptop
+      await relay.setPassword(laptop.rustdesk_id, newPassword);
+
+      // Save new password in DB
+      await db().run(
+        `UPDATE laptops SET rustdesk_password = ? WHERE id = ?`,
+        [newPassword, laptop.id]
+      );
+      await db().run(
+        `UPDATE agents SET rustdesk_password = ? WHERE rustdesk_id = ?`,
+        [newPassword, laptop.rustdesk_id]
+      );
+
+      // Notify group (no credentials in group)
+      await bot.sendMessage(groupChatId,
+        `✅ ${username} has been assigned: *${escapeMarkdown(laptop.name)}*\n🔐 Credentials sent via DM.`,
+        { parse_mode: "Markdown" }
+      );
+
+      // DM the user with credentials
+      await sendPasswordDM(userId, laptop.name, laptop.rustdesk_id, newPassword, groupChatId);
+
+    } catch (err) {
+      console.log("Security assignment error:", err.message);
+      await bot.sendMessage(groupChatId,
+        `⚠️ ${username} has been assigned *${escapeMarkdown(laptop.name)}* but the security agent did not respond. Please let an admin handle this.`,
+        { parse_mode: "Markdown" }
+      );
+    }
+
+  } else {
+    // Standard assignment message (no RustDesk credentials)
+    await bot.sendMessage(groupChatId, `✅ ${username} has been assigned: ${laptop.name}`);
+  }
+}
+
+// On laptop return — reset password if advanced security
+async function handleLaptopReturn(laptop, groupChatId) {
+  if (laptop.advanced_security && laptop.rustdesk_id && relay.isConnected(laptop.rustdesk_id)) {
+    try {
+      const newPassword = generatePassword();
+      await relay.setPassword(laptop.rustdesk_id, newPassword);
+      await db().run(
+        `UPDATE laptops SET rustdesk_password = ? WHERE id = ?`,
+        [newPassword, laptop.id]
+      );
+      await db().run(
+        `UPDATE agents SET rustdesk_password = ? WHERE rustdesk_id = ?`,
+        [newPassword, laptop.rustdesk_id]
+      );
+      console.log(`🔐 Password rotated on return for ${laptop.name}`);
+    } catch (err) {
+      console.log("Password rotation on return failed:", err.message);
+    }
+  }
+
+  await db().run(
+    `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
+    [laptop.id]
+  );
+}
+
+// ─── TRACK USER ─────────────────────────────────────────────────────────────
+
 async function trackUser(userId, username, firstName, groupType) {
   await db().run(
     `INSERT INTO users (user_id, username, first_name, group_type)
@@ -106,7 +259,8 @@ async function trackUser(userId, username, firstName, groupType) {
   );
 }
 
-// ---------------- ASK NEXT IN QUEUE ----------------
+// ─── QUEUE ──────────────────────────────────────────────────────────────────
+
 async function askNextInQueue(laptopId, groupType) {
   const nextUser = await db().get(
     `SELECT * FROM queue WHERE group_type = ? ORDER BY id ASC LIMIT 1`,
@@ -118,22 +272,11 @@ async function askNextInQueue(laptopId, groupType) {
     return;
   }
 
-  const laptop = await db().get(
-    `SELECT * FROM laptops WHERE id = ?`, [laptopId]
-  );
-
+  const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
   if (!laptop) return;
 
-  // If user already has a pending check, skip and ask next
   if (pendingChecks[nextUser.user_id]) {
     console.log(`User ${nextUser.user_id} already has pending check, skipping`);
-    const tempQueue = await db().get(
-      `SELECT * FROM queue WHERE group_type = ? AND id != ? ORDER BY id ASC LIMIT 1`,
-      [groupType, nextUser.id]
-    );
-    if (tempQueue) {
-      await askNextInQueue(laptopId, groupType);
-    }
     return;
   }
 
@@ -154,7 +297,6 @@ async function askNextInQueue(laptopId, groupType) {
 
   const timeout = setTimeout(async () => {
     if (!pendingChecks[nextUser.user_id]) return;
-
     delete pendingChecks[nextUser.user_id];
 
     await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
@@ -173,7 +315,8 @@ async function askNextInQueue(laptopId, groupType) {
   pendingChecks[nextUser.user_id] = { laptopId, timeout, groupType };
 }
 
-// ---------------- START ----------------
+// ─── START ───────────────────────────────────────────────────────────────────
+
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const groupType = getGroupType(chatId);
@@ -189,7 +332,8 @@ bot.onText(/\/start/, (msg) => {
   return bot.sendMessage(chatId, "Welcome to Laptop Manager", normalKeyboard);
 });
 
-// ---------------- MESSAGE HANDLER ----------------
+// ─── MESSAGE HANDLER ─────────────────────────────────────────────────────────
+
 bot.on("message", async (msg) => {
   const text = (msg.text || "").trim();
   const chatId = msg.chat.id;
@@ -200,17 +344,15 @@ bot.on("message", async (msg) => {
   const isAdmin = ADMIN_IDS.includes(userId);
   const groupType = getGroupType(chatId);
 
-  // Track all group users
   if (msg.chat.type !== "private" && groupType) {
     await trackUser(userId, msg.from.username || null, firstName, groupType);
   }
 
-  // Block private messages from normal users
   if (msg.chat.type === "private" && !isAdmin) {
     return bot.sendMessage(chatId, "⚠️ Please use the group chat to interact with the bot.");
   }
 
-  // ---------------- ADMIN CONTROLS ----------------
+  // ── ADMIN CONTROLS ──
   if (lower === "admin controls") {
     if (!isAdmin) {
       return bot.sendMessage(chatId, "⛔ You don't have access to admin controls.");
@@ -224,24 +366,51 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // ---------------- ADMIN TEXT INPUT ----------------
+  // ── ADMIN TEXT INPUT ──
   if (adminState[userId]) {
     if (!isAdmin) return;
 
     const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
     if (reserved.includes(lower)) return;
 
-    // Awaiting laptop name
     if (adminState[userId].action === "awaiting_laptop_name") {
       const laptopName = text;
       delete adminState[userId];
       await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
-      await bot.sendMessage(userId, `✅ ${laptopName} added to stasis.`);
+      await bot.sendMessage(userId, `✅ ${escapeMarkdownlaptopName} added to stasis.`);
       await sendAdminPanel(userId);
       return;
     }
 
-    // Awaiting search query for force assign
+if (adminState[userId].action === "awaiting_password_search") {
+      const query = text.toLowerCase().trim();
+      delete adminState[userId];
+
+      const laptops = await db().all(
+        `SELECT * FROM laptops WHERE advanced_security = 1 AND LOWER(name) LIKE ?`,
+        [`%${query}%`]
+      );
+
+      if (!laptops.length) {
+        await bot.sendMessage(userId, `⚠️ No secure laptops found matching "${text}".`);
+        return sendAdminPanel(userId);
+      }
+
+      let msg = `🔑 PASSWORD SEARCH: "${text}"\n\n`;
+      for (const l of laptops) {
+        const online = l.rustdesk_id && relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
+        const status = l.agent_connected ? "online" : "offline";
+        msg += `${online} *${l.name}*\n`;
+        msg += `     ID: \`${l.rustdesk_id || "not linked"}\`\n`;
+        msg += `     Password: \`${l.rustdesk_password || "unknown"}\`\n`;
+        msg += `     Status: ${status}\n\n`;
+      }
+
+      await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+      return sendAdminPanel(userId);
+    }
+
+
     if (adminState[userId].action === "awaiting_fa_search") {
       const query = text.replace(/^@/, "").toLowerCase();
 
@@ -257,10 +426,7 @@ bot.on("message", async (msg) => {
 
       const buttons = results.map(u => {
         const label = u.username ? `@${u.username}` : u.first_name;
-        return [{
-          text: label,
-          callback_data: `fa_user_${u.user_id}_${u.group_type}`
-        }];
+        return [{ text: label, callback_data: `fa_user_${u.user_id}_${u.group_type}` }];
       });
       buttons.push([{ text: "🔍 Search Again", callback_data: "force_assign" }]);
       buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
@@ -271,9 +437,42 @@ bot.on("message", async (msg) => {
         reply_markup: { inline_keyboard: buttons }
       });
     }
+
+    // Awaiting laptop name for security link
+    if (adminState[userId].action === "awaiting_security_name") {
+      const { rustdesk_id } = adminState[userId];
+      const laptopName = text.trim();
+      delete adminState[userId];
+
+      // Find laptop by name
+      const laptop = await db().get(`SELECT * FROM laptops WHERE LOWER(name) = LOWER(?)`, [laptopName]);
+      if (!laptop) {
+        await bot.sendMessage(userId,
+          `⚠️ No laptop found with name "${escapeMarkdown(laptopName)}". Try again or check the exact name in your laptop list.`,
+          { reply_markup: { inline_keyboard: [[{ text: "🚫 Cancel", callback_data: "cancel" }]] } }
+        );
+        return;
+      }
+
+      // Link agent to laptop
+      await db().run(
+        `UPDATE laptops SET rustdesk_id = ?, agent_connected = 1 WHERE id = ?`,
+        [rustdesk_id, laptop.id]
+      );
+      await db().run(
+        `UPDATE agents SET laptop_id = ? WHERE rustdesk_id = ?`,
+        [laptop.id, rustdesk_id]
+      );
+
+      await bot.sendMessage(userId,
+        `✅ Agent \`${rustdesk_id}\` linked to *${laptop.name}*.\n\nNow activate advanced security for this laptop from the Security menu.`,
+        { parse_mode: "Markdown" }
+      );
+      await sendAdminPanel(userId);
+      return;
+    }
   }
 
-  // ---------------- /admin ----------------
   if (text === "/admin" && isAdmin) {
     try {
       await sendAdminPanel(userId);
@@ -283,21 +482,15 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Only process group messages from here
   if (msg.chat.type === "private") return;
 
-  // ---------------- EXPERT GROUP ----------------
+  // ── EXPERT GROUP ──
   if (groupType === "expert") {
 
-    // CHOOSE A LAPTOP
     if (lower === "choose a laptop") {
       try {
-        const existing = await db().get(
-          `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-        );
-        if (existing) {
-          return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
-        }
+        const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+        if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
 
         const expertLaptops = await db().all(
           `SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`
@@ -321,36 +514,22 @@ bot.on("message", async (msg) => {
       }
     }
 
-    // MY LAPTOP (expert)
     if (lower === "my laptop") {
-      const laptop = await db().get(
-        `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-      );
+      const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
       if (!laptop) return bot.sendMessage(chatId, "❌ You don't have an expert laptop.");
       return bot.sendMessage(chatId, `💻 ${username} is assigned to: ${laptop.name}`);
     }
 
-    // RETURN LAPTOP (expert)
     if (lower === "return laptop") {
       try {
-        const laptop = await db().get(
-          `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-        );
+        const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
         if (!laptop) return bot.sendMessage(chatId, "❌ You don't have an expert laptop.");
 
-        await db().run(
-          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
-          [laptop.id]
-        );
-
+        await handleLaptopReturn(laptop, EXPERT_GROUP_CHAT_ID);
         await bot.sendMessage(chatId, `🔄 ${username} returned: ${laptop.name}`);
 
-        const queueCount = await db().get(
-          `SELECT COUNT(*) as count FROM queue WHERE group_type = 'expert'`
-        );
-        if (queueCount.count > 0) {
-          await askNextInQueue(laptop.id, "expert");
-        }
+        const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = 'expert'`);
+        if (queueCount.count > 0) await askNextInQueue(laptop.id, "expert");
       } catch (err) {
         console.log("EXPERT RETURN ERROR:", err);
         return bot.sendMessage(chatId, "❌ Error occurred during return.");
@@ -360,15 +539,12 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // ---------------- NORMAL GROUP ----------------
+  // ── NORMAL GROUP ──
   if (groupType === "normal") {
 
-    // REQUEST LAPTOP
     if (lower.includes("request")) {
       try {
-        const existing = await db().get(
-          `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-        );
+        const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
         if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
 
         const inQueue = await db().get(
@@ -388,60 +564,38 @@ bot.on("message", async (msg) => {
           return bot.sendMessage(chatId, "⏳ No laptops available. You've been added to queue.");
         }
 
-        const now = getAssignedAt();
-        await db().run(
-          `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
-          [userId, username, now, laptop.id]
-        );
+        await assignLaptopToUser(laptop, userId, username, GROUP_CHAT_ID);
 
-        return bot.sendMessage(chatId, `✅ ${username} has been assigned: ${laptop.name}`);
       } catch (err) {
         console.log("REQUEST ERROR:", err);
         return bot.sendMessage(chatId, "❌ Error occurred during request.");
       }
     }
 
-    // RETURN LAPTOP
     if (lower.includes("return")) {
       try {
-        const laptop = await db().get(
-          `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-        );
+        const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
         if (!laptop) return bot.sendMessage(chatId, "❌ You don't have a laptop.");
 
-        await db().run(
-          `UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`,
-          [laptop.id]
-        );
-
+        await handleLaptopReturn(laptop, GROUP_CHAT_ID);
         await bot.sendMessage(chatId, `🔄 ${username} returned: ${laptop.name}`);
 
-        const queueCount = await db().get(
-          `SELECT COUNT(*) as count FROM queue WHERE group_type = 'normal'`
-        );
-        if (queueCount.count > 0) {
-          await askNextInQueue(laptop.id, "normal");
-        }
+        const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = 'normal'`);
+        if (queueCount.count > 0) await askNextInQueue(laptop.id, "normal");
       } catch (err) {
         console.log("RETURN ERROR:", err);
         return bot.sendMessage(chatId, "❌ Error occurred during return.");
       }
     }
 
-    // MY LAPTOP
     if (lower.includes("my laptop")) {
-      const laptop = await db().get(
-        `SELECT * FROM laptops WHERE assigned_to = ?`, [userId]
-      );
+      const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
       if (!laptop) return bot.sendMessage(chatId, "❌ You don't have a laptop.");
       return bot.sendMessage(chatId, `💻 ${username} is assigned to: ${laptop.name}`);
     }
 
-    // VIEW QUEUE
     if (lower.includes("view queue") || lower === "queue") {
-      const queue = await db().all(
-        `SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`
-      );
+      const queue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
       if (!queue.length) return bot.sendMessage(chatId, "📊 Queue is empty.");
 
       const list = queue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n");
@@ -450,7 +604,8 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ---------------- CALLBACK HANDLER ----------------
+// ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
+
 bot.on("callback_query", async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const userId = callbackQuery.from.id;
@@ -466,44 +621,30 @@ bot.on("callback_query", async (callbackQuery) => {
     console.log("Callback query expired");
   }
 
-  // ---------------- EXPERT LAPTOP PICK ----------------
+  // ── EXPERT LAPTOP PICK ──
   if (data.startsWith("expert_pick_")) {
     const laptopId = parseInt(data.split("_")[2]);
 
     const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
-    if (existing) {
-      return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
-    }
+    if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
 
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
-
     if (!laptop || laptop.status !== "available") {
       return bot.sendMessage(chatId, "⚠️ That laptop is no longer available.");
     }
 
-    const now = getAssignedAt();
-    await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
-      [userId, username, now, laptopId]
-    );
-
-    return bot.sendMessage(EXPERT_GROUP_CHAT_ID, `✅ ${username} is working on: ${laptop.name}`);
+    await assignLaptopToUser(laptop, userId, username, EXPERT_GROUP_CHAT_ID);
+    return;
   }
 
-  // ---------------- AVAILABILITY YES ----------------
+  // ── AVAILABILITY YES ──
   if (data.startsWith("available_yes_")) {
     const parts = data.split("_");
     const laptopId = parseInt(parts[2]);
     const targetUserId = parseInt(parts[3]);
 
-    // Only the tagged user can respond
-    if (userId !== targetUserId) {
-      return bot.answerCallbackQuery(callbackQuery.id, { text: "This is not for you.", show_alert: true });
-    }
-
-    if (!pendingChecks[userId]) {
-      return bot.sendMessage(chatId, "⚠️ This request has already expired.");
-    }
+    if (userId !== targetUserId) return;
+    if (!pendingChecks[userId]) return bot.sendMessage(chatId, "⚠️ This request has already expired.");
 
     const groupType = pendingChecks[userId].groupType;
     clearTimeout(pendingChecks[userId].timeout);
@@ -515,29 +656,20 @@ bot.on("callback_query", async (callbackQuery) => {
     }
 
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
-    const now = getAssignedAt();
-    await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
-      [userId, username, now, laptopId]
-    );
 
     const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
-    return bot.sendMessage(targetGroupId, `✅ ${username} has been assigned: ${laptop.name}`);
+    await assignLaptopToUser(laptop, userId, username, targetGroupId);
+    return;
   }
 
-  // ---------------- AVAILABILITY NO ----------------
+  // ── AVAILABILITY NO ──
   if (data.startsWith("available_no_")) {
     const parts = data.split("_");
     const laptopId = parseInt(parts[2]);
     const targetUserId = parseInt(parts[3]);
 
-    if (userId !== targetUserId) {
-      return bot.answerCallbackQuery(callbackQuery.id, { text: "This is not for you.", show_alert: true });
-    }
-
-    if (!pendingChecks[userId]) {
-      return bot.sendMessage(chatId, "⚠️ This request has already expired.");
-    }
+    if (userId !== targetUserId) return;
+    if (!pendingChecks[userId]) return bot.sendMessage(chatId, "⚠️ This request has already expired.");
 
     const groupType = pendingChecks[userId].groupType;
     clearTimeout(pendingChecks[userId].timeout);
@@ -554,7 +686,6 @@ bot.on("callback_query", async (callbackQuery) => {
   // Admin only from here
   if (!isAdmin) return;
 
-  // ---------------- CANCEL ----------------
   const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
 
   if (data === "cancel") {
@@ -562,7 +693,7 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 
-  // ---------------- ADD LAPTOP ----------------
+  // ── ADD LAPTOP ──
   if (data === "add_laptop") {
     adminState[userId] = { action: "awaiting_laptop_name" };
     return bot.sendMessage(userId, "💬 Send me the name of the new laptop:", {
@@ -570,7 +701,7 @@ bot.on("callback_query", async (callbackQuery) => {
     });
   }
 
-  // ---------------- STASIS MENU ----------------
+  // ── STASIS MENU ──
   if (data === "stasis_menu") {
     return bot.sendMessage(userId, "📦 Stasis — deploy a laptop to a group:", {
       reply_markup: {
@@ -609,24 +740,16 @@ bot.on("callback_query", async (callbackQuery) => {
     const laptopId = parseInt(parts[2]);
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-    await db().run(
-      `UPDATE laptops SET status = 'available', group_type = ? WHERE id = ?`,
-      [targetGroup, laptopId]
-    );
-
+    await db().run(`UPDATE laptops SET status = 'available', group_type = ? WHERE id = ?`, [targetGroup, laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} deployed to ${targetGroup} group.`);
 
-    const queueCount = await db().get(
-      `SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [targetGroup]
-    );
-    if (queueCount.count > 0) {
-      await askNextInQueue(laptopId, targetGroup);
-    }
+    const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [targetGroup]);
+    if (queueCount.count > 0) await askNextInQueue(laptopId, targetGroup);
 
     return sendAdminPanel(userId);
   }
 
-  // ---------------- REMOVE LAPTOP ----------------
+  // ── REMOVE LAPTOP ──
   if (data === "remove_laptop") {
     const activeLaptops = await db().all(
       `SELECT * FROM laptops WHERE status = 'available' OR status = 'assigned'`
@@ -669,7 +792,7 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 
-  // ---------------- OFFLINE MENU ----------------
+  // ── OFFLINE MENU ──
   if (data === "offline_menu") {
     return bot.sendMessage(userId, "🔌 Offline menu:", {
       reply_markup: {
@@ -683,9 +806,7 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   if (data === "add_offline") {
-    const laptops = await db().all(
-      `SELECT * FROM laptops WHERE status != 'offline'`
-    );
+    const laptops = await db().all(`SELECT * FROM laptops WHERE status != 'offline'`);
 
     if (!laptops.length) {
       await bot.sendMessage(userId, "📭 No laptops to put offline.");
@@ -703,7 +824,7 @@ bot.on("callback_query", async (callbackQuery) => {
     });
   }
 
-  if (data.startsWith("offline_")) {
+  if (data.startsWith("offline_") && !data.startsWith("offline_menu")) {
     const laptopId = parseInt(data.split("_")[1]);
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
@@ -747,16 +868,12 @@ bot.on("callback_query", async (callbackQuery) => {
     const laptopId = parseInt(data.split("_")[1]);
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-    await db().run(
-      `UPDATE laptops SET status = 'stasis', group_type = 'stasis' WHERE id = ?`,
-      [laptopId]
-    );
-
+    await db().run(`UPDATE laptops SET status = 'stasis', group_type = 'stasis' WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} restored to stasis.`);
     return sendAdminPanel(userId);
   }
 
-  // ---------------- TRANSFER MENU ----------------
+  // ── TRANSFER MENU ──
   if (data === "transfer_menu") {
     return bot.sendMessage(userId, "🔄 Transfer laptops between groups:", {
       reply_markup: {
@@ -802,11 +919,8 @@ bot.on("callback_query", async (callbackQuery) => {
 
     const selected = adminState[userId].selected;
     const idx = selected.indexOf(laptopId);
-    if (idx === -1) {
-      selected.push(laptopId);
-    } else {
-      selected.splice(idx, 1);
-    }
+    if (idx === -1) selected.push(laptopId);
+    else selected.splice(idx, 1);
 
     const laptops = await db().all(
       `SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`,
@@ -864,7 +978,7 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 
-  // ---------------- FORCE ASSIGN ----------------
+  // ── FORCE ASSIGN ──
   if (data === "force_assign") {
     adminState[userId] = { action: "awaiting_fa_search" };
     return bot.sendMessage(userId, "🔍 Type a name or username to search for a user:", {
@@ -877,7 +991,6 @@ bot.on("callback_query", async (callbackQuery) => {
     });
   }
 
-  // Pick from queue fallback
   if (data === "force_assign_queue") {
     const normalQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
     const expertQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
@@ -899,19 +1012,11 @@ bot.on("callback_query", async (callbackQuery) => {
     });
   }
 
-  if (data === "fa_manual") {
-    adminState[userId] = { action: "awaiting_fa_username" };
-    return bot.sendMessage(userId, "✏️ Type the username or first name of the user (with or without @):", {
-      reply_markup: { inline_keyboard: [cancelButton] }
-    });
-  }
-
   if (data.startsWith("fa_user_")) {
     const parts = data.split("_");
     const targetUserId = parseInt(parts[2]);
     const userGroupType = parts[3];
 
-    // Try to get display name from users table first, then queue
     const targetUser = await db().get(`SELECT * FROM users WHERE user_id = ?`, [targetUserId]);
     const queueUser = await db().get(`SELECT * FROM queue WHERE user_id = ?`, [targetUserId]);
     const targetUsername = targetUser
@@ -920,9 +1025,7 @@ bot.on("callback_query", async (callbackQuery) => {
 
     adminState[userId] = { action: "force_assign_select_laptop", targetUserId, targetUsername, userGroupType };
 
-    const laptops = await db().all(
-      `SELECT * FROM laptops WHERE status = 'available' OR status = 'stasis'`
-    );
+    const laptops = await db().all(`SELECT * FROM laptops WHERE status = 'available' OR status = 'stasis'`);
 
     if (!laptops.length) {
       await bot.sendMessage(userId, "📭 No laptops available to assign.");
@@ -953,7 +1056,6 @@ bot.on("callback_query", async (callbackQuery) => {
 
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
 
-    // Check if user already has a laptop and unassign it first
     const existingLaptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [targetUserId]);
     if (existingLaptop) {
       const oldGroupId = existingLaptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
@@ -964,28 +1066,20 @@ bot.on("callback_query", async (callbackQuery) => {
       await bot.sendMessage(oldGroupId,
         `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`
       );
-      const queueCount = await db().get(
-        `SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]
-      );
-      if (queueCount.count > 0) {
-        await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
-      }
+      const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]);
+      if (queueCount.count > 0) await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
     }
 
     await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
-    const now = getAssignedAt();
-    await db().run(
-      `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, group_type = ?, assigned_at = ? WHERE id = ?`,
-      [targetUserId, targetUsername, userGroupType, now, laptopId]
-    );
 
     const targetGroupId = userGroupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
-    await bot.sendMessage(targetGroupId, `⚡ ${targetUsername} has been assigned to ${laptop.name}`);
+    await assignLaptopToUser(laptop, targetUserId, targetUsername, targetGroupId);
+
     await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
     return sendAdminPanel(userId);
   }
 
-  // ---------------- DELETE LAPTOP ----------------
+  // ── DELETE LAPTOP ──
   if (data === "delete_laptop") {
     return bot.sendMessage(userId, "🗑 Delete — filter by status:", {
       reply_markup: {
@@ -1034,12 +1128,10 @@ bot.on("callback_query", async (callbackQuery) => {
 
     return bot.sendMessage(userId, `⚠️ Are you sure you want to delete ${laptop.name}?`, {
       reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Yes, Delete", callback_data: `dodelete_${laptopId}` },
-            { text: "❌ No, Cancel", callback_data: "cancel" }
-          ]
-        ]
+        inline_keyboard: [[
+          { text: "✅ Yes, Delete", callback_data: `dodelete_${laptopId}` },
+          { text: "❌ No, Cancel", callback_data: "cancel" }
+        ]]
       }
     });
   }
@@ -1060,51 +1152,263 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 
-  // ---------------- STATUS ----------------
+  // ── STATUS ──
   if (data === "status") {
-    const normalAssigned = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'normal'`);
-    const expertAssigned = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'expert'`);
+    const normalAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'normal'`);
+    const expertAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'expert'`);
     const normalAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal'`);
     const expertAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`);
-    const normalQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
-    const expertQueue = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
-    const stasis = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
-    const offline = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
+    const normalQueue     = await db().all(`SELECT * FROM queue WHERE group_type = 'normal' ORDER BY id ASC`);
+    const expertQueue     = await db().all(`SELECT * FROM queue WHERE group_type = 'expert' ORDER BY id ASC`);
+    const stasis          = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
+    const offline         = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
 
-    let msg = "📊 STATUS\n\n";
+    let statusMsg = "📊 STATUS\n\n";
 
-    msg += "💻 In Use (Normal):\n";
-    msg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || 'unknown'})`).join("\n") + "\n" : "None\n";
+    statusMsg += "💻 In Use (Normal):\n";
+    statusMsg += normalAssigned.length
+      ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || "unknown"})`).join("\n") + "\n"
+      : "None\n";
 
-    msg += "\n💻 In Use (Expert):\n";
-    msg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || 'unknown'})`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n💻 In Use (Expert):\n";
+    statusMsg += expertAssigned.length
+      ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (since ${l.assigned_at || "unknown"})`).join("\n") + "\n"
+      : "None\n";
 
-    msg += "\n✅ Available (Normal):\n";
-    msg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n✅ Available (Normal):\n";
+    statusMsg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    msg += "\n✅ Available (Expert):\n";
-    msg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n✅ Available (Expert):\n";
+    statusMsg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    msg += "\n📋 Queue (Normal):\n";
-    msg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
+    statusMsg += "\n📋 Queue (Normal):\n";
+    statusMsg += normalQueue.length ? normalQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
 
-    msg += "\n📋 Queue (Expert):\n";
-    msg += expertQueue.length ? expertQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
+    statusMsg += "\n📋 Queue (Expert):\n";
+    statusMsg += expertQueue.length ? expertQueue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n") + "\n" : "Empty\n";
 
-    msg += "\n📦 In Stasis:\n";
-    msg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n📦 In Stasis:\n";
+    statusMsg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    msg += "\n🔌 Offline:\n";
-    msg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n🔌 Offline:\n";
+    statusMsg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    await bot.sendMessage(userId, msg);
+    await bot.sendMessage(userId, statusMsg);
     return sendAdminPanel(userId);
   }
+
+  // ════════════════════════════════════════════════
+  // 🔐 SECURITY MENU
+  // ════════════════════════════════════════════════
+
+if (data === "security_menu") {
+    return bot.sendMessage(userId, "🔐 Security Panel:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔗 Link Agent to Laptop", callback_data: "sec_link_agent" }],
+          [{ text: "🛡 Activate Advanced Security", callback_data: "sec_activate" }],
+          [{ text: "🔓 Deactivate Advanced Security", callback_data: "sec_deactivate" }],
+          [{ text: "📡 Live Agent Status", callback_data: "sec_status" }],
+          [{ text: "🔑 Password Search", callback_data: "sec_password_search" }],
+          cancelButton
+        ]
+      }
+    });
+  }
+  // ── LIVE AGENT STATUS ──
+
+if (data === "sec_password_search") {
+    adminState[userId] = { action: "awaiting_password_search" };
+    return bot.sendMessage(userId, "🔍 Type the laptop name to search:", {
+      reply_markup: { inline_keyboard: [cancelButton] }
+    });
+  }
+
+  if (data === "sec_status") {
+    const connectedAgents = relay.getConnectedAgents();
+    const allSecureLaptops = await db().all(`SELECT * FROM laptops WHERE advanced_security = 1`);
+
+    let msg = "📡 LIVE AGENT STATUS\n\n";
+
+    if (!connectedAgents.length && !allSecureLaptops.length) {
+      msg += "No agents connected and no laptops with advanced security.";
+    }
+
+    if (connectedAgents.length) {
+      msg += "🟢 Connected Agents:\n";
+      for (const agent of connectedAgents) {
+        const laptop = await db().get(`SELECT * FROM laptops WHERE rustdesk_id = ?`, [agent.rustdesk_id]);
+        const laptopLabel = laptop ? laptop.name : "⚠️ Not linked to a laptop";
+        msg += `• ID: \`${agent.rustdesk_id}\`\n  Laptop: ${escapeMarkdown(laptopLabel)}\n  Password: \`${agent.password}\`\n\n`;
+      }
+    }
+
+    const offlineSecure = allSecureLaptops.filter(l => !relay.isConnected(l.rustdesk_id));
+    if (offlineSecure.length) {
+      msg += "🔴 Offline (Advanced Security laptops not connected):\n";
+      for (const l of offlineSecure) {
+        msg += `• ${l.name} (ID: \`${l.rustdesk_id || "unknown"}\`)\n`;
+      }
+    }
+
+    await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+    return bot.sendMessage(userId, "🔐 Security Panel:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔗 Link Agent to Laptop", callback_data: "sec_link_agent" }],
+          [{ text: "🛡 Activate Advanced Security", callback_data: "sec_activate" }],
+          [{ text: "🔓 Deactivate Advanced Security", callback_data: "sec_deactivate" }],
+          [{ text: "📡 Live Agent Status", callback_data: "sec_status" }],
+          cancelButton
+        ]
+      }
+    });
+  }
+
+  // ── LINK AGENT TO LAPTOP ──
+  if (data === "sec_link_agent") {
+    const connectedAgents = relay.getConnectedAgents();
+
+    if (!connectedAgents.length) {
+      await bot.sendMessage(userId, "⚠️ No agents currently connected. Make sure the agent program is running on the laptop.");
+      return bot.sendMessage(userId, "🔐 Security Panel:", {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔗 Link Agent to Laptop", callback_data: "sec_link_agent" }],
+            [{ text: "📡 Live Agent Status", callback_data: "sec_status" }],
+            cancelButton
+          ]
+        }
+      });
+    }
+
+    // Show unlinked agents (not yet assigned to a laptop)
+    const buttons = [];
+    for (const agent of connectedAgents) {
+      const existingLink = await db().get(`SELECT name FROM laptops WHERE rustdesk_id = ?`, [agent.rustdesk_id]);
+      const label = existingLink
+        ? `${agent.rustdesk_id} (linked to ${existingLink.name})`
+        : `${agent.rustdesk_id} (not linked)`;
+      buttons.push([{ text: label, callback_data: `sec_pick_agent_${agent.rustdesk_id}` }]);
+    }
+    buttons.push(cancelButton);
+
+    return bot.sendMessage(userId, "Select an agent to link to a laptop:", {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
+  if (data.startsWith("sec_pick_agent_")) {
+    const rustdesk_id = data.replace("sec_pick_agent_", "");
+    adminState[userId] = { action: "awaiting_security_name", rustdesk_id };
+
+    return bot.sendMessage(userId,
+      `🔗 Linking agent \`${rustdesk_id}\`\n\nType the *exact name* of the laptop in your system (e.g. "Dell XPS 15"):`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: [cancelButton] }
+      }
+    );
+  }
+
+  // ── ACTIVATE ADVANCED SECURITY ──
+  if (data === "sec_activate") {
+    // Show laptops that have an agent linked but security not yet active
+    const laptops = await db().all(
+      `SELECT * FROM laptops WHERE rustdesk_id IS NOT NULL AND advanced_security = 0`
+    );
+
+    if (!laptops.length) {
+      await bot.sendMessage(userId, "⚠️ No laptops with a linked agent available to activate. Link an agent first.");
+      return sendAdminPanel(userId);
+    }
+
+    const buttons = laptops.map(l => {
+      const online = relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
+      return [{ text: `${online} ${l.name} (${l.rustdesk_id})`, callback_data: `sec_do_activate_${l.id}` }];
+    });
+    buttons.push(cancelButton);
+
+    return bot.sendMessage(userId, "Select a laptop to activate advanced security:", {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
+  if (data.startsWith("sec_do_activate_")) {
+    const laptopId = parseInt(data.replace("sec_do_activate_", ""));
+    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+
+    if (!laptop || !laptop.rustdesk_id) {
+      await bot.sendMessage(userId, "⚠️ Laptop not found or no agent linked.");
+      return sendAdminPanel(userId);
+    }
+
+    // Send handshake to confirm agent is alive
+    await bot.sendMessage(userId, `🤝 Sending handshake to ${laptop.name}...`);
+
+    if (!relay.isConnected(laptop.rustdesk_id)) {
+      await bot.sendMessage(userId, `❌ Agent for ${laptop.name} is not connected. Make sure the program is running on that laptop.`);
+      return sendAdminPanel(userId);
+    }
+
+    try {
+      await relay.handshake(laptop.rustdesk_id);
+      await db().run(`UPDATE laptops SET advanced_security = 1 WHERE id = ?`, [laptopId]);
+      await bot.sendMessage(userId,
+        `✅ Handshake successful!\n\n🔐 Advanced security activated for *${escapeMarkdown(laptop.name)}*.\n\nFrom now on, users assigned this laptop will receive RustDesk credentials via DM.`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      await bot.sendMessage(userId,
+        `❌ Handshake failed for ${escapeMarkdown(laptop.name)}: ${err.message}\n\nCheck the agent is running correctly.`
+      );
+    }
+
+    return sendAdminPanel(userId);
+  }
+
+  // ── DEACTIVATE ADVANCED SECURITY ──
+  if (data === "sec_deactivate") {
+    const laptops = await db().all(`SELECT * FROM laptops WHERE advanced_security = 1`);
+
+    if (!laptops.length) {
+      await bot.sendMessage(userId, "⚠️ No laptops with advanced security active.");
+      return sendAdminPanel(userId);
+    }
+
+    const buttons = laptops.map(l => {
+      const online = relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
+      return [{ text: `${online} ${l.name}`, callback_data: `sec_do_deactivate_${l.id}` }];
+    });
+    buttons.push(cancelButton);
+
+    return bot.sendMessage(userId, "Select a laptop to deactivate advanced security:", {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
+  if (data.startsWith("sec_do_deactivate_")) {
+    const laptopId = parseInt(data.replace("sec_do_deactivate_", ""));
+    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+
+    await db().run(`UPDATE laptops SET advanced_security = 0 WHERE id = ?`, [laptopId]);
+    await bot.sendMessage(userId, `✅ Advanced security deactivated for *${escapeMarkdown(laptop.name)}*. It will now operate normally.`, { parse_mode: "Markdown" });
+    return sendAdminPanel(userId);
+  }
+
 });
 
-// ---------------- KEEP ALIVE SERVER ----------------
+// ─── KEEP ALIVE SERVER ───────────────────────────────────────────────────────
 const http = require("http");
 http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Bot is running");
 }).listen(process.env.PORT || 3000);
+
+bot.on("polling_error", (err) => {
+  console.log("Polling error:", err.message);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.log("Unhandled rejection:", err.message);
+});

@@ -6,7 +6,7 @@ async function initDB() {
   database = new Database("./bot.db");
 
   database.exec(`
-    CREATE TABLE IF NOT EXISTS laptops ( 
+    CREATE TABLE IF NOT EXISTS laptops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT,
       status TEXT DEFAULT 'stasis',
@@ -16,13 +16,21 @@ async function initDB() {
     )
   `);
 
+  try { database.exec(`ALTER TABLE laptops ADD COLUMN assigned_at TEXT`); } catch (e) {}
+  try { database.exec(`ALTER TABLE laptops ADD COLUMN rustdesk_id TEXT`); } catch (e) {}
+  try { database.exec(`ALTER TABLE laptops ADD COLUMN rustdesk_password TEXT`); } catch (e) {}
+  try { database.exec(`ALTER TABLE laptops ADD COLUMN agent_connected INTEGER DEFAULT 0`); } catch (e) {}
+  try { database.exec(`ALTER TABLE laptops ADD COLUMN advanced_security INTEGER DEFAULT 0`); } catch (e) {}
 
-  try {
-    database.exec(`
-      ALTER TABLE laptops ADD COLUMN assigned_at TEXT `);
-  } catch (e) {
-    console.error("Error adding column:", e);
-  }
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rustdesk_id TEXT UNIQUE,
+      rustdesk_password TEXT,
+      last_seen TEXT,
+      laptop_id INTEGER
+    )
+  `);
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS queue (
@@ -47,8 +55,8 @@ async function initDB() {
   if (count.count === 0) {
     database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('Dell XPS 15', 'available', 'normal');
     database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('HP EliteBook', 'available', 'normal');
-    database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('MacBook Pro (e)', 'available', 'expert');
-    database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('Lenovo ThinkPad (e)', 'available', 'expert');
+    database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('MacBook Pro e', 'available', 'expert');
+    database.prepare(`INSERT INTO laptops (name, status, group_type) VALUES (?, ?, ?)`).run('Lenovo ThinkPad e', 'available', 'expert');
   }
 
   console.log("✅ DB initialized");

@@ -12,6 +12,7 @@ const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589];
 
 const pendingChecks = {};
+const missedChecks = {};
 const adminState = {};
 
 (async () => {
@@ -107,7 +108,8 @@ async function sendAdminPanel(targetId) {
           [{ text: "🗑 Delete Laptop", callback_data: "delete_laptop" }],
           [{ text: "📊 Status", callback_data: "status" }],
           [{ text: "🔐 Security", callback_data: "security_menu" }],
-          [{ text: "📋 Laptop Logs", callback_data: "logs_menu" }]
+          [{ text: "📋 Laptop Logs", callback_data: "logs_menu" }],
+          [{ text: "🗑 Clear Queue", callback_data: "clear_queue" }]
         ]
       }
     });
@@ -253,10 +255,26 @@ async function askNextInQueue(laptopId, groupType) {
   const timeout = setTimeout(async () => {
     if (!pendingChecks[nextUser.user_id]) return;
     delete pendingChecks[nextUser.user_id];
-    await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
-    await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, ?)`, [nextUser.user_id, nextUser.username, groupType]);
-    await bot.sendMessage(targetGroupId, `⏰ ${mention} didn't respond in time and has been moved to the bottom of the queue.`);
-    await askNextInQueue(laptopId, groupType);
+
+    missedChecks[nextUser.user_id] = (missedChecks[nextUser.user_id] || 0) + 1;
+
+    if (missedChecks[nextUser.user_id] >= 2) {
+      // Two strikes — remove from queue entirely
+      delete missedChecks[nextUser.user_id];
+      await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
+      await bot.sendMessage(targetGroupId, `❌ ${mention} didn't respond twice and has been removed from the queue.`);
+    } else {
+      // First strike — move to bottom
+      await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
+      await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, ?)`, [nextUser.user_id, nextUser.username, groupType]);
+      await bot.sendMessage(targetGroupId, `⏰ ${mention} didn't respond in time and has been moved to the bottom of the queue. (1/2 — one more miss and you'll be removed)`);
+    }
+
+    // Only recurse if the next person in line is someone different
+    const nextInLine = await db().get(`SELECT * FROM queue WHERE group_type = ? ORDER BY id ASC LIMIT 1`, [groupType]);
+    if (nextInLine && nextInLine.user_id !== nextUser.user_id) {
+      await askNextInQueue(laptopId, groupType);
+    }
   }, 1 * 60 * 1000);
 
   pendingChecks[nextUser.user_id] = { laptopId, timeout, groupType };
@@ -540,6 +558,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const groupType = pendingChecks[userId].groupType;
     clearTimeout(pendingChecks[userId].timeout);
     delete pendingChecks[userId];
+    delete missedChecks[userId];
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
     if (!laptop || laptop.status !== "available") return bot.sendMessage(chatId, "⚠️ Laptop is no longer available.");
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
@@ -557,6 +576,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const groupType = pendingChecks[userId].groupType;
     clearTimeout(pendingChecks[userId].timeout);
     delete pendingChecks[userId];
+    delete missedChecks[userId];
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
     const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await bot.sendMessage(targetGroupId, `${username} has opted out and been removed from the queue.`);
@@ -788,6 +808,11 @@ bot.on("callback_query", async (callbackQuery) => {
       if (queueCount.count > 0) await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
     }
     await db().run(`DELETE FROM queue WHERE user_id = ?`, [targetUserId]);
+    if (pendingChecks[targetUserId]) {
+      clearTimeout(pendingChecks[targetUserId].timeout);
+      delete pendingChecks[targetUserId];
+      delete missedChecks[targetUserId];
+    }
     const targetGroupId = userGroupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await assignLaptopToUser(laptop, targetUserId, targetUsername, targetGroupId);
     await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
@@ -906,6 +931,29 @@ bot.on("callback_query", async (callbackQuery) => {
     return sendAdminPanel(userId);
   }
 
+  // ── CLEAR QUEUE ──
+  if (data === "clear_queue") {
+    return bot.sendMessage(userId, "⚠️ Are you sure you want to clear the entire queue? This cannot be undone.", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Yes, Clear Queue", callback_data: "clear_queue_confirm" }, { text: "❌ Cancel", callback_data: "cancel" }]
+        ]
+      }
+    });
+  }
+
+  if (data === "clear_queue_confirm") {
+    await db().run(`DELETE FROM queue`);
+    // Cancel all pending checks
+    for (const uid of Object.keys(pendingChecks)) {
+      clearTimeout(pendingChecks[uid].timeout);
+      delete pendingChecks[uid];
+      delete missedChecks[uid];
+    }
+    await bot.sendMessage(userId, "✅ Queue has been cleared.");
+    return sendAdminPanel(userId);
+  }
+
   // ════════════════════════════════════════════════
   // 🔐 SECURITY MENU
   // ════════════════════════════════════════════════
@@ -930,12 +978,12 @@ bot.on("callback_query", async (callbackQuery) => {
     return bot.sendMessage(userId, "🔍 Type a laptop name to search:", { reply_markup: { inline_keyboard: [cancelButton] } });
   }
 
-if (data.startsWith("showpw_")) {
+  if (data.startsWith("showpw_")) {
     const laptopId = parseInt(data.replace("showpw_", ""));
     const l = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
     const online = l.rustdesk_id && relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
-    const msg = `${online} ${l.name}\nID: ${l.rustdesk_id || "not linked"}\nPassword: ${l.rustdesk_password || "unknown"}`;
-    await bot.sendMessage(userId, msg);
+    const msg = `${online} *${escapeMarkdown(l.name)}*\nID: \`${l.rustdesk_id || "not linked"}\`\nPassword: \`${l.rustdesk_password || "unknown"}\``;
+    await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
     return sendAdminPanel(userId);
   }
 

@@ -10,7 +10,6 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589];
-
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
@@ -124,6 +123,12 @@ async function notifyNeedsStart(chatId, username) {
   );
 }
 
+// Sends to both normal groups; pass options as you would to bot.sendMessage
+async function sendToNormalGroups(message, options = {}) {
+  await bot.sendMessage(GROUP_CHAT_ID, message, options);
+  await bot.sendMessage(GROUP_CHAT_ID_2, message, options);
+}
+
 async function sendPasswordDM(userId, laptopName, rustdesk_id, password, groupChatId) {
   try {
     await bot.sendMessage(userId,
@@ -142,6 +147,7 @@ async function sendPasswordDM(userId, laptopName, rustdesk_id, password, groupCh
 async function assignLaptopToUser(laptop, userId, username, groupChatId) {
   const now = getAssignedAt();
   const nowISO = new Date().toISOString();
+  const isNormalGroup = groupChatId === GROUP_CHAT_ID;
 
   await db().run(
     `UPDATE laptops SET status = 'assigned', assigned_to = ?, assigned_username = ?, assigned_at = ? WHERE id = ?`,
@@ -153,9 +159,14 @@ async function assignLaptopToUser(laptop, userId, username, groupChatId) {
     [laptop.id, laptop.name, userId, username, nowISO]
   );
 
+  const sendGroup = async (msg, opts = {}) => {
+    await bot.sendMessage(groupChatId, msg, opts);
+    if (isNormalGroup) await bot.sendMessage(GROUP_CHAT_ID_2, msg, opts);
+  };
+
   if (laptop.advanced_security && laptop.rustdesk_id) {
     if (!relay.isConnected(laptop.rustdesk_id)) {
-      await bot.sendMessage(groupChatId,
+      await sendGroup(
         `⚠️ ${escapeMarkdown(username)} has been assigned *${escapeMarkdown(laptop.name)}* but there seems to be a disconnection with this laptop's security agent. Please let an admin handle this.`,
         { parse_mode: "Markdown" }
       );
@@ -166,20 +177,20 @@ async function assignLaptopToUser(laptop, userId, username, groupChatId) {
       await relay.setPassword(laptop.rustdesk_id, newPassword);
       await db().run(`UPDATE laptops SET rustdesk_password = ? WHERE id = ?`, [newPassword, laptop.id]);
       await db().run(`UPDATE agents SET rustdesk_password = ? WHERE rustdesk_id = ?`, [newPassword, laptop.rustdesk_id]);
-      await bot.sendMessage(groupChatId,
+      await sendGroup(
         `✅ ${escapeMarkdown(username)} has been assigned: *${escapeMarkdown(laptop.name)}*\n🔐 Credentials sent via DM.`,
         { parse_mode: "Markdown" }
       );
       await sendPasswordDM(userId, laptop.name, laptop.rustdesk_id, newPassword, groupChatId);
     } catch (err) {
       console.log("Security assignment error:", err.message);
-      await bot.sendMessage(groupChatId,
+      await sendGroup(
         `⚠️ ${escapeMarkdown(username)} has been assigned *${escapeMarkdown(laptop.name)}* but the security agent did not respond. Please let an admin handle this.`,
         { parse_mode: "Markdown" }
       );
     }
   } else {
-    await bot.sendMessage(groupChatId, `✅ ${username} has been assigned: ${laptop.name}`);
+    await sendGroup(`✅ ${username} has been assigned: ${laptop.name}`);
   }
 }
 
@@ -239,8 +250,13 @@ async function askNextInQueue(laptopId, groupType) {
 
   const mention = nextUser.username ? `@${nextUser.username.replace("@", "")}` : `User ${nextUser.user_id}`;
   const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+  const isNormalGroup = groupType !== "expert";
+  const sendToTarget = async (msg, opts = {}) => {
+    await bot.sendMessage(targetGroupId, msg, opts);
+    if (isNormalGroup) await bot.sendMessage(GROUP_CHAT_ID_2, msg, opts);
+  };
 
-  await bot.sendMessage(targetGroupId,
+  await sendToTarget(
     `🔔 ${mention}, a laptop is available: ${laptop.name}\n\nAre you still available to work?`,
     {
       reply_markup: {
@@ -262,12 +278,12 @@ async function askNextInQueue(laptopId, groupType) {
       // Two strikes — remove from queue entirely
       delete missedChecks[nextUser.user_id];
       await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
-      await bot.sendMessage(targetGroupId, `❌ ${mention} didn't respond twice and has been removed from the queue.`);
+      await sendToTarget(`❌ ${mention} didn't respond twice and has been removed from the queue.`);
     } else {
       // First strike — move to bottom
       await db().run(`DELETE FROM queue WHERE id = ?`, [nextUser.id]);
       await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, ?)`, [nextUser.user_id, nextUser.username, groupType]);
-      await bot.sendMessage(targetGroupId, `⏰ ${mention} didn't respond in time and has been moved to the bottom of the queue. (1/2 — one more miss and you'll be removed)`);
+      await sendToTarget(`⏰ ${mention} didn't respond in time and has been moved to the bottom of the queue. (1/2 — one more miss and you'll be removed)`);
     }
 
     // Only recurse if the next person in line is someone different
@@ -580,6 +596,7 @@ bot.on("callback_query", async (callbackQuery) => {
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
     const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await bot.sendMessage(targetGroupId, `${username} has opted out and been removed from the queue.`);
+    if (groupType !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `${username} has opted out and been removed from the queue.`);
     await askNextInQueue(laptopId, groupType);
     return;
   }
@@ -646,6 +663,7 @@ bot.on("callback_query", async (callbackQuery) => {
       const assignedUsername = laptop.assigned_username || `User ${laptop.assigned_to}`;
       const targetGroupId = laptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
       await bot.sendMessage(targetGroupId, `⚠️ ${assignedUsername} has been removed from ${laptop.name}. Please submit your work.`);
+      if (laptop.group_type !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `⚠️ ${assignedUsername} has been removed from ${laptop.name}. Please submit your work.`);
     }
     await db().run(`UPDATE laptops SET status = 'stasis', group_type = 'stasis', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} has been put in stasis.`);
@@ -679,6 +697,7 @@ bot.on("callback_query", async (callbackQuery) => {
       const assignedUsername = laptop.assigned_username || `User ${laptop.assigned_to}`;
       const targetGroupId = laptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
       await bot.sendMessage(targetGroupId, `⚠️ ${assignedUsername} has been removed from ${laptop.name}. The laptop is going offline.`);
+      if (laptop.group_type !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `⚠️ ${assignedUsername} has been removed from ${laptop.name}. The laptop is going offline.`);
     }
     await db().run(`UPDATE laptops SET status = 'offline', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} is now offline.`);
@@ -755,6 +774,7 @@ bot.on("callback_query", async (callbackQuery) => {
     }
     const targetGroupId = toGroup === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await bot.sendMessage(targetGroupId, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
+    if (toGroup !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
     await bot.sendMessage(userId, `✅ Transferred ${names.join(", ")} to ${toGroup} group.`);
     return sendAdminPanel(userId);
   }
@@ -804,6 +824,7 @@ bot.on("callback_query", async (callbackQuery) => {
       const oldGroupId = existingLaptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
       await db().run(`UPDATE laptops SET status = 'available', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`, [existingLaptop.id]);
       await bot.sendMessage(oldGroupId, `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`);
+      if (existingLaptop.group_type !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `⚠️ ${targetUsername} has been removed from ${existingLaptop.name}. Please submit your work.`);
       const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [existingLaptop.group_type]);
       if (queueCount.count > 0) await askNextInQueue(existingLaptop.id, existingLaptop.group_type);
     }
@@ -867,6 +888,7 @@ bot.on("callback_query", async (callbackQuery) => {
     if (laptop.assigned_to) {
       const targetGroupId = laptop.group_type === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
       await bot.sendMessage(targetGroupId, `⚠️ ${laptop.assigned_username || `User ${laptop.assigned_to}`} has been removed from ${laptop.name}. The laptop has been deleted.`);
+      if (laptop.group_type !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `⚠️ ${laptop.assigned_username || `User ${laptop.assigned_to}`} has been removed from ${laptop.name}. The laptop has been deleted.`);
     }
     await db().run(`DELETE FROM laptops WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} has been deleted.`);
@@ -909,17 +931,52 @@ bot.on("callback_query", async (callbackQuery) => {
   if (data.startsWith("showlogs_")) {
     const laptopId = parseInt(data.replace("showlogs_", ""));
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
-    const threeDaysAgo = new Date();
-    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-    const logs = await db().all(
-      `SELECT * FROM laptop_logs WHERE laptop_id = ? AND action_time >= ? ORDER BY action_time ASC`,
-      [laptopId, threeDaysAgo.toISOString()]
-    );
+    if (!laptop) { await bot.sendMessage(userId, "⚠️ Laptop not found."); return sendAdminPanel(userId); }
+    return bot.sendMessage(userId, `📋 *${escapeMarkdown(laptop.name)}* — Select a time range:`, {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "Last 3 Days", callback_data: `logs_range_${laptopId}_3` }],
+          [{ text: "Last 7 Days", callback_data: `logs_range_${laptopId}_7` }],
+          [{ text: "Last 30 Days", callback_data: `logs_range_${laptopId}_30` }],
+          [{ text: "All Time", callback_data: `logs_range_${laptopId}_0` }],
+          [{ text: "🚫 Cancel", callback_data: "cancel" }]
+        ]
+      }
+    });
+  }
+
+  if (data.startsWith("logs_range_")) {
+    const parts = data.replace("logs_range_", "").split("_");
+    const laptopId = parseInt(parts[0]);
+    const days = parseInt(parts[1]);
+    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+    if (!laptop) { await bot.sendMessage(userId, "⚠️ Laptop not found."); return sendAdminPanel(userId); }
+
+    let logs;
+    let rangeLabel;
+    if (days === 0) {
+      logs = await db().all(
+        `SELECT * FROM laptop_logs WHERE laptop_id = ? ORDER BY action_time ASC`,
+        [laptopId]
+      );
+      rangeLabel = "All Time";
+    } else {
+      const since = new Date();
+      since.setDate(since.getDate() - days);
+      logs = await db().all(
+        `SELECT * FROM laptop_logs WHERE laptop_id = ? AND action_time >= ? ORDER BY action_time ASC`,
+        [laptopId, since.toISOString()]
+      );
+      rangeLabel = `Last ${days} Days`;
+    }
+
     if (!logs.length) {
-      await bot.sendMessage(userId, `📋 No logs for *${escapeMarkdown(laptop.name)}* in the past 3 days.`, { parse_mode: "Markdown" });
+      await bot.sendMessage(userId, `📋 No logs for *${escapeMarkdown(laptop.name)}* (${rangeLabel}).`, { parse_mode: "Markdown" });
       return sendAdminPanel(userId);
     }
-    let msg = `📋 *${escapeMarkdown(laptop.name)}* — Last 3 Days\n\n`;
+
+    let msg = `📋 *${escapeMarkdown(laptop.name)}* — ${rangeLabel}\n\n`;
     for (const log of logs) {
       const icon = log.action === "assigned" ? "🟢" : "🔴";
       const action = log.action === "assigned" ? "Assigned to" : "Returned by";
@@ -927,7 +984,18 @@ bot.on("callback_query", async (callbackQuery) => {
       msg += `${icon} ${action}: ${escapeMarkdown(user)}\n`;
       msg += `   🕐 ${formatLogTime(log.action_time)}\n\n`;
     }
-    await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+
+    if (msg.length > 4096) {
+      const chunks = [];
+      let remaining = msg;
+      while (remaining.length > 0) {
+        chunks.push(remaining.slice(0, 4096));
+        remaining = remaining.slice(4096);
+      }
+      for (const chunk of chunks) await bot.sendMessage(userId, chunk, { parse_mode: "Markdown" });
+    } else {
+      await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+    }
     return sendAdminPanel(userId);
   }
 

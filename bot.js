@@ -71,7 +71,7 @@ const expertKeyboard = {
 
 function getGroupType(chatId) {
   if (chatId === EXPERT_GROUP_CHAT_ID) return "expert";
-  if (chatId === GROUP_CHAT_ID) return "normal";
+  if (chatId === GROUP_CHAT_ID || chatId === GROUP_CHAT_ID_2) return "normal";
   return null;
 }
 

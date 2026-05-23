@@ -78,9 +78,7 @@ function getGroupType(chatId) {
 }
 
 function getAssignedAt() {
-  const now = new Date();
-  now.setHours(now.getHours() + 1);
-  return now.toLocaleString("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: true });
+  return new Date().toISOString();
 }
 
 function generatePassword() {
@@ -348,8 +346,13 @@ bot.on("message", async (msg) => {
     const helpUsername = adminState[userId].helpUsername;
     delete adminState[userId];
     delete pendingAdminHelp[helpUserId];
-    const adminMentions = ADMIN_IDS.map(id => `[Admin](tg://user?id=${id})`).join(" ");
-    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${escapeMarkdown(helpUsername)}\nID: ${helpUserId}\n\n*Issue:*\n${escapeMarkdown(issue)}\n\n${adminMentions}`;
+    const adminUsers = await db().all(
+      `SELECT username FROM users WHERE user_id IN (${ADMIN_IDS.join(",")}) AND username IS NOT NULL`
+    );
+    const adminMentions = adminUsers.length
+      ? adminUsers.map(u => `@${u.username.replace(/^@/, "")}`).join(" ")
+      : "";
+    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${escapeMarkdown(helpUsername)}\n\n*Issue:*\n${escapeMarkdown(issue)}${adminMentions ? `\n\n${adminMentions}` : ""}`;
     try {
       await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "Markdown" });
       await bot.sendMessage(chatId, "✅ Your issue has been sent to the admins. Someone will assist you shortly.");
@@ -1000,9 +1003,9 @@ bot.on("callback_query", async (callbackQuery) => {
     const offline         = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
     let statusMsg = "📊 LAPTOP STATUS\n\n";
     statusMsg += "💻 Normal — Assigned:\n";
-    statusMsg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${l.assigned_at || ""})`).join("\n") + "\n" : "None\n";
+    statusMsg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
     statusMsg += "\n💻 Expert — Assigned:\n";
-    statusMsg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${l.assigned_at || ""})`).join("\n") + "\n" : "None\n";
+    statusMsg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
     statusMsg += "\n✅ Normal — Available:\n";
     statusMsg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
     statusMsg += "\n✅ Expert — Available:\n";

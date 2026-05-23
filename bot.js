@@ -347,6 +347,7 @@ bot.on("message", async (msg) => {
     delete adminState[userId];
     delete pendingAdminHelp[helpUserId];
 
+    try {
 const adminUsers = await db().all(
   `SELECT user_id, username FROM users WHERE user_id IN (${ADMIN_IDS.join(",")}) AND username IS NOT NULL`
 );

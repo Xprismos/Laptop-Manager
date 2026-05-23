@@ -346,15 +346,16 @@ bot.on("message", async (msg) => {
     const helpUsername = adminState[userId].helpUsername;
     delete adminState[userId];
     delete pendingAdminHelp[helpUserId];
-const adminUsers = await db().all(
-  `SELECT user_id, username FROM users WHERE user_id IN (${ADMIN_IDS.join(",")}) AND username IS NOT NULL`
-);
-const adminMentions = adminUsers.length
-  ? adminUsers.map(u => `<a href="tg://user?id=${u.user_id}">${u.username}</a>`).join(" ")
-  : "";
-const helpMsg = `🆘 Admin Help Request\n\nFrom: ${helpUsername}\n\nIssue:\n${issue}${adminMentions ? `\n\n${adminMentions}` : ""}`;
 
-await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
+    const adminUsers = await db().all(
+      `SELECT username FROM users WHERE user_id IN (${ADMIN_IDS.join(",")}) AND username IS NOT NULL`
+    );
+    const adminMentions = adminUsers.length
+      ? adminUsers.map(u => `@${u.username.replace(/^@/, "")}`).join(" ")
+      : "";
+    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${helpUsername}\n\n*Issue:*\n${issue}${adminMentions ? `\n\n${adminMentions}` : ""}`;
+    try {
+      await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg);
       await bot.sendMessage(chatId, "✅ Your issue has been sent to the admins. Someone will assist you shortly.");
     } catch (e) {
       console.log("Admin help send error:", e.message);

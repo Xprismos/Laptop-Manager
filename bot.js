@@ -352,7 +352,7 @@ bot.on("message", async (msg) => {
     const adminMentions = adminUsers.length
       ? adminUsers.map(u => `@${u.username.replace(/^@/, "")}`).join(" ")
       : "";
-    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${escapeMarkdown(helpUsername)}\n\n*Issue:*\n${escapeMarkdown(issue)}${adminMentions ? `\n\n${adminMentions}` : ""}`;
+    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${helpUsername}\n\n*Issue:*\n${issue}${adminMentions ? `\n\n${adminMentions}` : ""}`;
     try {
       await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "Markdown" });
       await bot.sendMessage(chatId, "✅ Your issue has been sent to the admins. Someone will assist you shortly.");

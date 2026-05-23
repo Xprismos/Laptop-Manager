@@ -354,7 +354,7 @@ bot.on("message", async (msg) => {
       : "";
     const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${helpUsername}\n\n*Issue:*\n${issue}${adminMentions ? `\n\n${adminMentions}` : ""}`;
     try {
-      await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "Markdown" });
+      await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg);
       await bot.sendMessage(chatId, "✅ Your issue has been sent to the admins. Someone will assist you shortly.");
     } catch (e) {
       console.log("Admin help send error:", e.message);

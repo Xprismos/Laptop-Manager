@@ -10,10 +10,12 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const GROUP_CHAT_ID_2 = -1003657694389;
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589,912497121];
+const ADMIN_HELP_GROUP_ID = 1003970027998;
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121];
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
+const pendingAdminHelp = {};
 
 (async () => {
   await initDB();
@@ -53,7 +55,7 @@ relay.onAgentDisconnect = async (rustdesk_id) => {
 
 const normalKeyboard = {
   reply_markup: {
-    keyboard: [["Request Laptop"], ["My Laptop"], ["Return Laptop"], ["View Queue"], ["Admin Controls"]],
+    keyboard: [["Request Laptop"], ["My Laptop"], ["Return Laptop"], ["View Queue"], ["Admin Help"], ["Admin Controls"]],
     resize_keyboard: true,
     persistent: true
   }
@@ -109,6 +111,7 @@ async function sendAdminPanel(targetId) {
           [{ text: "📊 Status", callback_data: "status" }],
           [{ text: "🔐 Security", callback_data: "security_menu" }],
           [{ text: "📋 Laptop Logs", callback_data: "logs_menu" }],
+          [{ text: "🕐 24h Workers", callback_data: "logs_24h" }],
           [{ text: "🗑 Clear Queue", callback_data: "clear_queue" }]
         ]
       }
@@ -338,11 +341,44 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ── ADMIN HELP INPUT (non-admin users) ──
+  if (adminState[userId] && adminState[userId].action === "awaiting_admin_help_issue") {
+    const issue = text;
+    const helpUserId = adminState[userId].helpUserId;
+    const helpUsername = adminState[userId].helpUsername;
+    delete adminState[userId];
+    delete pendingAdminHelp[helpUserId];
+    const adminMentions = ADMIN_IDS.map(id => `[Admin](tg://user?id=${id})`).join(" ");
+    const helpMsg = `🆘 *Admin Help Request*\n\nFrom: ${escapeMarkdown(helpUsername)}\nID: ${helpUserId}\n\n*Issue:*\n${escapeMarkdown(issue)}\n\n${adminMentions}`;
+    try {
+      await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "Markdown" });
+      await bot.sendMessage(chatId, "✅ Your issue has been sent to the admins. Someone will assist you shortly.");
+    } catch (e) {
+      console.log("Admin help send error:", e.message);
+      await bot.sendMessage(chatId, "❌ Could not send your message. Please try again.");
+    }
+    return;
+  }
+
   // ── ADMIN TEXT INPUT ──
   if (adminState[userId]) {
     if (!isAdmin) return;
-    const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "choose a laptop"];
+    const reserved = ["request laptop", "my laptop", "return laptop", "view queue", "admin controls", "admin help", "choose a laptop"];
     if (reserved.includes(lower)) return;
+
+    if (adminState[userId].action === "awaiting_remove_search") {
+      const query = stripEmoji(text.toLowerCase().trim());
+      delete adminState[userId];
+      const allLaptops = await db().all(`SELECT * FROM laptops WHERE status = 'available' OR status = 'assigned'`);
+      const laptops = allLaptops.filter(l => stripEmoji(l.name.toLowerCase()).includes(query));
+      if (!laptops.length) {
+        await bot.sendMessage(userId, `⚠️ No active laptops found matching "${text}". Try again.`);
+        return sendAdminPanel(userId);
+      }
+      const buttons = laptops.map(l => ([{ text: `❌ ${l.name} (${l.status} - ${l.group_type})`, callback_data: `remove_${l.id}` }]));
+      buttons.push([{ text: "🚫 Cancel", callback_data: "cancel" }]);
+      return bot.sendMessage(userId, `Select a laptop to put in stasis:`, { reply_markup: { inline_keyboard: buttons } });
+    }
 
     if (adminState[userId].action === "awaiting_laptop_name") {
       const laptopName = text;
@@ -507,12 +543,24 @@ bot.on("message", async (msg) => {
         if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
         const inQueue = await db().get(`SELECT * FROM queue WHERE user_id = ? AND group_type = 'normal'`, [userId]);
         if (inQueue) return bot.sendMessage(chatId, "⏳ You are already in queue.");
-        const laptop = await db().get(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal' ORDER BY RANDOM() LIMIT 1`);
-        if (!laptop) {
-          await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, 'normal')`, [userId, username]);
-          return bot.sendMessage(chatId, "⏳ No laptops available. You've been added to queue.");
-        }
-        await assignLaptopToUser(laptop, userId, username, GROUP_CHAT_ID);
+        const sentMsg = await bot.sendMessage(chatId,
+          `${username}, are you available to work?`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ Yes", callback_data: `req_confirm_yes_${userId}` },
+                { text: "❌ No", callback_data: `req_confirm_no_${userId}` }
+              ]]
+            }
+          }
+        );
+        const timeout = setTimeout(async () => {
+          try {
+            await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: sentMsg.message_id });
+            await bot.sendMessage(chatId, `⏰ ${username}, your request confirmation expired. Please make another request.`);
+          } catch (e) { console.log("Request confirm timeout cleanup error:", e.message); }
+        }, 3 * 60 * 1000);
+        pendingAdminHelp[`req_${userId}`] = { chatId, timeout };
       } catch (err) {
         console.log("REQUEST ERROR:", err);
         return bot.sendMessage(chatId, "❌ Error occurred during request.");
@@ -541,6 +589,13 @@ bot.on("message", async (msg) => {
       if (!queue.length) return bot.sendMessage(chatId, "📊 Queue is empty.");
       const list = queue.map((q, i) => `${i + 1}. ${q.username || `User ${q.user_id}`}`).join("\n");
       return bot.sendMessage(chatId, `📊 QUEUE\n\n${list}`);
+    }
+    if (lower === "admin help") {
+      const existing = pendingAdminHelp[userId];
+      if (existing) return bot.sendMessage(chatId, "⏳ You already have a pending admin help request. Please type your issue.");
+      pendingAdminHelp[userId] = true;
+      adminState[userId] = { action: "awaiting_admin_help_issue", helpUserId: userId, helpUsername: username };
+      return bot.sendMessage(chatId, "📝 Please type the issue you are facing and I will forward it to the admins.");
     }
   }
 });
@@ -602,6 +657,48 @@ bot.on("callback_query", async (callbackQuery) => {
     return;
   }
 
+  // ── REQUEST CONFIRMATION ──
+  if (data.startsWith("req_confirm_yes_")) {
+    const targetUserId = parseInt(data.replace("req_confirm_yes_", ""));
+    if (userId !== targetUserId) return;
+    const pending = pendingAdminHelp[`req_${userId}`];
+    if (!pending) return bot.sendMessage(chatId, "⚠️ This request has already expired.");
+    clearTimeout(pending.timeout);
+    delete pendingAdminHelp[`req_${userId}`];
+    try {
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: callbackQuery.message.message_id });
+    } catch (e) {}
+    try {
+      const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+      if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
+      const inQueue = await db().get(`SELECT * FROM queue WHERE user_id = ? AND group_type = 'normal'`, [userId]);
+      if (inQueue) return bot.sendMessage(chatId, "⏳ You are already in queue.");
+      const laptop = await db().get(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal' ORDER BY RANDOM() LIMIT 1`);
+      if (!laptop) {
+        await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, 'normal')`, [userId, username]);
+        return bot.sendMessage(chatId, "⏳ No laptops available. You've been added to queue.");
+      }
+      await assignLaptopToUser(laptop, userId, username, GROUP_CHAT_ID);
+    } catch (err) {
+      console.log("REQUEST CONFIRM ERROR:", err);
+      return bot.sendMessage(chatId, "❌ Error occurred during request.");
+    }
+    return;
+  }
+
+  if (data.startsWith("req_confirm_no_")) {
+    const targetUserId = parseInt(data.replace("req_confirm_no_", ""));
+    if (userId !== targetUserId) return;
+    const pending = pendingAdminHelp[`req_${userId}`];
+    if (!pending) return bot.sendMessage(chatId, "⚠️ This request has already expired.");
+    clearTimeout(pending.timeout);
+    delete pendingAdminHelp[`req_${userId}`];
+    try {
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: callbackQuery.message.message_id });
+    } catch (e) {}
+    return bot.sendMessage(chatId, `👍 No problem ${username}. Request cancelled.`);
+  }
+
   if (!isAdmin) return;
 
   const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
@@ -650,11 +747,8 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   if (data === "remove_laptop") {
-    const activeLaptops = await db().all(`SELECT * FROM laptops WHERE status = 'available' OR status = 'assigned'`);
-    if (!activeLaptops.length) { await bot.sendMessage(userId, "📭 No active laptops."); return sendAdminPanel(userId); }
-    const buttons = activeLaptops.map(l => ([{ text: `❌ ${l.name} (${l.status} - ${l.group_type})`, callback_data: `remove_${l.id}` }]));
-    buttons.push(cancelButton);
-    return bot.sendMessage(userId, "Select a laptop to put in stasis:", { reply_markup: { inline_keyboard: buttons } });
+    adminState[userId] = { action: "awaiting_remove_search" };
+    return bot.sendMessage(userId, "🔍 Type a laptop name to search:", { reply_markup: { inline_keyboard: [cancelButton] } });
   }
 
   if (data.startsWith("remove_") && !data.startsWith("remove_laptop")) {
@@ -1020,6 +1114,36 @@ bot.on("callback_query", async (callbackQuery) => {
       delete missedChecks[uid];
     }
     await bot.sendMessage(userId, "✅ Queue has been cleared.");
+    return sendAdminPanel(userId);
+  }
+
+  // ── 24H WORKERS ──
+  if (data === "logs_24h") {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const workers = await db().all(
+      `SELECT l.name as laptop_name, l.assigned_username, l.assigned_to, l.assigned_at
+       FROM laptops l
+       WHERE l.status = 'assigned' AND l.assigned_at IS NOT NULL`,
+    );
+    const longWorkers = workers.filter(w => {
+      if (!w.assigned_at) return false;
+      const assignedDate = new Date(w.assigned_at);
+      return !isNaN(assignedDate) && assignedDate < new Date(cutoff);
+    });
+    if (!longWorkers.length) {
+      await bot.sendMessage(userId, "✅ No workers have been on a laptop for more than 24 hours.");
+      return sendAdminPanel(userId);
+    }
+    let msg = "🕐 *WORKERS ON FOR 24h+*\n\n";
+    for (const w of longWorkers) {
+      const assignedDate = new Date(w.assigned_at);
+      const hoursOn = Math.floor((Date.now() - assignedDate.getTime()) / (1000 * 60 * 60));
+      msg += `👤 ${escapeMarkdown(w.assigned_username || `User ${w.assigned_to}`)}\n`;
+      msg += `💻 ${escapeMarkdown(w.laptop_name)}\n`;
+      msg += `🕐 Requested: ${formatLogTime(assignedDate.toISOString())}\n`;
+      msg += `⏱ On for: ~${hoursOn}h\n\n`;
+    }
+    await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
     return sendAdminPanel(userId);
   }
 

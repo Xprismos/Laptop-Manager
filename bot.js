@@ -11,7 +11,7 @@ const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const GROUP_CHAT_ID_2 = -1003657694389;
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_HELP_GROUP_ID = -1003970027998;
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121];
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121, 8635686304 ];
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
@@ -871,6 +871,8 @@ bot.on("callback_query", async (callbackQuery) => {
       const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
       await db().run(`UPDATE laptops SET group_type = ? WHERE id = ?`, [toGroup, laptopId]);
       names.push(laptop.name);
+      const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [toGroup]);
+      if (queueCount.count > 0) await askNextInQueue(laptopId, toGroup);
     }
     const targetGroupId = toGroup === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await bot.sendMessage(targetGroupId, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);

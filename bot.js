@@ -11,7 +11,7 @@ const GROUP_CHAT_ID = parseInt(process.env.GROUP_CHAT_ID);
 const GROUP_CHAT_ID_2 = -1003657694389;
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_HELP_GROUP_ID = -1003970027998;
-const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121, 8635686304 ];
+const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121, 8635686304];
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
@@ -245,7 +245,6 @@ async function askNextInQueue(laptopId, groupType) {
   // Verify the laptop is still available — it may have been assigned already
   let laptop = await db().get(`SELECT * FROM laptops WHERE id = ? AND status = 'available'`, [laptopId]);
   if (!laptop) {
-    // Fall back to any available laptop for this group
     laptop = await db().get(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [groupType]);
     if (!laptop) { console.log("No available laptops for queue group:", groupType); return; }
   }
@@ -683,6 +682,12 @@ bot.on("callback_query", async (callbackQuery) => {
       if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
       const inQueue = await db().get(`SELECT * FROM queue WHERE user_id = ? AND group_type = 'normal'`, [userId]);
       if (inQueue) return bot.sendMessage(chatId, "⏳ You are already in queue.");
+      // If others are already queued, join the back — don't jump ahead
+      const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = 'normal'`);
+      if (queueCount.count > 0) {
+        await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, 'normal')`, [userId, username]);
+        return bot.sendMessage(chatId, `⏳ There are people ahead of you. You've been added to the queue.`);
+      }
       const laptop = await db().get(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal' ORDER BY RANDOM() LIMIT 1`);
       if (!laptop) {
         await db().run(`INSERT INTO queue (user_id, username, group_type) VALUES (?, ?, 'normal')`, [userId, username]);

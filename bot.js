@@ -242,8 +242,13 @@ async function askNextInQueue(laptopId, groupType) {
   const nextUser = await db().get(`SELECT * FROM queue WHERE group_type = ? ORDER BY id ASC LIMIT 1`, [groupType]);
   if (!nextUser) { console.log("Queue is empty for", groupType); return; }
 
-  const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
-  if (!laptop) return;
+  // Verify the laptop is still available — it may have been assigned already
+  let laptop = await db().get(`SELECT * FROM laptops WHERE id = ? AND status = 'available'`, [laptopId]);
+  if (!laptop) {
+    // Fall back to any available laptop for this group
+    laptop = await db().get(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [groupType]);
+    if (!laptop) { console.log("No available laptops for queue group:", groupType); return; }
+  }
 
   if (pendingChecks[nextUser.user_id]) {
     console.log(`User ${nextUser.user_id} already has pending check, skipping`);

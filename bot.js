@@ -16,6 +16,7 @@ const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
 const pendingAdminHelp = {};
+const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
 
 (async () => {
   await initDB();
@@ -824,8 +825,6 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   if (!isAdmin) return;
-
-  const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
 
   if (data === "cancel") {
     delete adminState[userId];

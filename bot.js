@@ -19,6 +19,14 @@ const pendingAdminHelp = {};
 
 (async () => {
   await initDB();
+  await db().run(`
+    CREATE TABLE IF NOT EXISTS custom_groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      chat_id INTEGER NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
+    )
+  `);
   console.log("🤖 Bot running");
 })();
 
@@ -71,10 +79,30 @@ const expertKeyboard = {
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
-function getGroupType(chatId) {
+async function getGroupType(chatId) {
   if (chatId === EXPERT_GROUP_CHAT_ID) return "expert";
   if (chatId === GROUP_CHAT_ID || chatId === GROUP_CHAT_ID_2) return "normal";
+  const cg = await db().get(`SELECT id FROM custom_groups WHERE chat_id = ?`, [chatId]);
+  if (cg) return `cg_${cg.id}`;
   return null;
+}
+
+async function getGroupChatId(groupType) {
+  if (groupType === "expert") return EXPERT_GROUP_CHAT_ID;
+  if (groupType === "normal") return GROUP_CHAT_ID;
+  const id = parseInt(groupType.replace("cg_", ""));
+  if (isNaN(id)) return null;
+  const cg = await db().get(`SELECT chat_id FROM custom_groups WHERE id = ?`, [id]);
+  return cg ? cg.chat_id : null;
+}
+
+async function getGroupName(groupType) {
+  if (groupType === "expert") return "Expert";
+  if (groupType === "normal") return "Normal";
+  const id = parseInt(groupType.replace("cg_", ""));
+  if (isNaN(id)) return groupType;
+  const cg = await db().get(`SELECT name FROM custom_groups WHERE id = ?`, [id]);
+  return cg ? cg.name : groupType;
 }
 
 function getAssignedAt() {
@@ -110,6 +138,7 @@ async function sendAdminPanel(targetId) {
           [{ text: "🔐 Security", callback_data: "security_menu" }],
           [{ text: "📋 Laptop Logs", callback_data: "logs_menu" }],
           [{ text: "🕐 24h Workers", callback_data: "logs_24h" }],
+          [{ text: "👥 Group Management", callback_data: "group_management" }],
           [{ text: "🗑 Clear Queue", callback_data: "clear_queue" }]
         ]
       }
@@ -255,11 +284,11 @@ async function askNextInQueue(laptopId, groupType) {
   }
 
   const mention = nextUser.username ? `@${nextUser.username.replace("@", "")}` : `User ${nextUser.user_id}`;
-  const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
-  const isNormalGroup = groupType !== "expert";
+  const targetGroupId = await getGroupChatId(groupType);
+  if (!targetGroupId) { console.log("No chat ID found for group:", groupType); return; }
   const sendToTarget = async (msg, opts = {}) => {
     await bot.sendMessage(targetGroupId, msg, opts);
-    if (isNormalGroup) await bot.sendMessage(GROUP_CHAT_ID_2, msg, opts);
+    if (groupType === "normal") await bot.sendMessage(GROUP_CHAT_ID_2, msg, opts);
   };
 
   await sendToTarget(
@@ -304,11 +333,11 @@ async function askNextInQueue(laptopId, groupType) {
 
 // ─── START ───────────────────────────────────────────────────────────────────
 
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const groupType = getGroupType(chatId);
+  const groupType = await getGroupType(chatId);
   if (msg.chat.type === "private") return bot.sendMessage(chatId, "👋 Welcome! Please use the group chat to interact with the bot.");
-  if (groupType === "expert") return bot.sendMessage(chatId, "Welcome to Laptop Manager", expertKeyboard);
+  if (groupType === "expert" || (groupType && groupType.startsWith("cg_"))) return bot.sendMessage(chatId, "Welcome to Laptop Manager", expertKeyboard);
   return bot.sendMessage(chatId, "Welcome to Laptop Manager", normalKeyboard);
 });
 
@@ -322,7 +351,7 @@ bot.on("message", async (msg) => {
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   const firstName = msg.from.first_name || "";
   const isAdmin = ADMIN_IDS.includes(userId);
-  const groupType = getGroupType(chatId);
+  const groupType = await getGroupType(chatId);
 
   if (msg.chat.type !== "private" && groupType) {
     await trackUser(userId, msg.from.username || null, firstName, groupType);
@@ -480,6 +509,39 @@ await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
       return bot.sendMessage(userId, `Select the laptop to link:`, { reply_markup: { inline_keyboard: buttons } });
     }
 
+    if (adminState[userId].action === "awaiting_group_name") {
+      const groupName = text.trim();
+      delete adminState[userId];
+      adminState[userId] = { action: "awaiting_group_chat_id", groupName };
+      return bot.sendMessage(userId,
+        `✅ Group name: "${groupName}"\n\nNow enter the Telegram Group ID:\n\n(Make sure you've added the bot to the group first, then paste the group ID here)`,
+        { reply_markup: { inline_keyboard: [cancelButton] } }
+      );
+    }
+
+    if (adminState[userId].action === "awaiting_group_chat_id") {
+      const chatIdInput = parseInt(text.trim());
+      if (isNaN(chatIdInput)) {
+        return bot.sendMessage(userId, "⚠️ Invalid ID. Please enter a valid number (negative for groups, e.g. -1001234567890).", { reply_markup: { inline_keyboard: [cancelButton] } });
+      }
+      const { groupName } = adminState[userId];
+      delete adminState[userId];
+      const existing = await db().get(`SELECT * FROM custom_groups WHERE chat_id = ?`, [chatIdInput]);
+      if (existing) {
+        await bot.sendMessage(userId, `⚠️ A group with this chat ID already exists: "${existing.name}".`);
+        return sendAdminPanel(userId);
+      }
+      const result = await db().run(`INSERT INTO custom_groups (name, chat_id, created_at) VALUES (?, ?, ?)`, [groupName, chatIdInput, new Date().toISOString()]);
+      const newGroupId = result.lastID;
+      try {
+        await bot.sendMessage(chatIdInput, `✅ Laptop Manager is now active in this group. Workers can request laptops using the buttons below.`, expertKeyboard);
+        await bot.sendMessage(userId, `✅ Group "${groupName}" added and verified! The bot sent a confirmation message to the group.`);
+      } catch (e) {
+        await bot.sendMessage(userId, `⚠️ Group "${groupName}" was saved but the bot couldn't send a message to it.\n\nMake sure the bot has been added to the group first.\n\nError: ${e.message}`);
+      }
+      return sendAdminPanel(userId);
+    }
+
     if (adminState[userId].action === "awaiting_fa_search") {
       const query = text.replace(/^@/, "").toLowerCase();
       const results = await db().all(
@@ -607,6 +669,43 @@ await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
       return bot.sendMessage(chatId, "📝 Please type the issue you are facing and I will forward it to the admins.");
     }
   }
+
+  // ── CUSTOM GROUP ──
+  if (groupType && groupType.startsWith("cg_")) {
+    const groupChatId = await getGroupChatId(groupType);
+    if (lower === "choose a laptop") {
+      try {
+        const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+        if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
+        const laptops = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [groupType]);
+        if (!laptops.length) return bot.sendMessage(chatId, "⏳ No laptops available. Please try again later.");
+        const buttons = laptops.map(l => ([{ text: l.name, callback_data: `cg_pick_${l.id}` }]));
+        return bot.sendMessage(chatId, "🖥 Select a laptop:", { reply_markup: { inline_keyboard: buttons } });
+      } catch (err) {
+        console.log("CG CHOOSE ERROR:", err);
+        return bot.sendMessage(chatId, "❌ Error occurred.");
+      }
+    }
+    if (lower === "my laptop") {
+      const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+      if (!laptop) return bot.sendMessage(chatId, "❌ You don't have a laptop.");
+      return bot.sendMessage(chatId, `💻 ${username} is assigned to: ${laptop.name}`);
+    }
+    if (lower === "return laptop") {
+      try {
+        const laptop = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+        if (!laptop) return bot.sendMessage(chatId, "❌ You don't have a laptop.");
+        await handleLaptopReturn(laptop, groupChatId);
+        await bot.sendMessage(chatId, `🔄 ${username} returned: ${laptop.name}`);
+        const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [groupType]);
+        if (queueCount.count > 0) await askNextInQueue(laptop.id, groupType);
+      } catch (err) {
+        console.log("CG RETURN ERROR:", err);
+        return bot.sendMessage(chatId, "❌ Error occurred during return.");
+      }
+    }
+    return;
+  }
 });
 
 // ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
@@ -619,6 +718,16 @@ bot.on("callback_query", async (callbackQuery) => {
   const isAdmin = ADMIN_IDS.includes(userId);
 
   try { await bot.answerCallbackQuery(callbackQuery.id); } catch (e) { console.log("Callback query expired"); }
+
+  if (data.startsWith("cg_pick_")) {
+    const laptopId = parseInt(data.replace("cg_pick_", ""));
+    const existing = await db().get(`SELECT * FROM laptops WHERE assigned_to = ?`, [userId]);
+    if (existing) return bot.sendMessage(chatId, `⚠️ You already have: ${existing.name}`);
+    const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+    if (!laptop || laptop.status !== "available") return bot.sendMessage(chatId, "⚠️ That laptop is no longer available.");
+    await assignLaptopToUser(laptop, userId, username, chatId);
+    return;
+  }
 
   if (data.startsWith("expert_pick_")) {
     const laptopId = parseInt(data.split("_")[2]);
@@ -643,7 +752,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
     if (!laptop || laptop.status !== "available") return bot.sendMessage(chatId, "⚠️ Laptop is no longer available.");
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
-    const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+    const targetGroupId = await getGroupChatId(groupType);
     await assignLaptopToUser(laptop, userId, username, targetGroupId);
     return;
   }
@@ -659,9 +768,9 @@ bot.on("callback_query", async (callbackQuery) => {
     delete pendingChecks[userId];
     delete missedChecks[userId];
     await db().run(`DELETE FROM queue WHERE user_id = ? AND group_type = ?`, [userId, groupType]);
-    const targetGroupId = groupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
+    const targetGroupId = await getGroupChatId(groupType);
     await bot.sendMessage(targetGroupId, `${username} has opted out and been removed from the queue.`);
-    if (groupType !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `${username} has opted out and been removed from the queue.`);
+    if (groupType === "normal") await bot.sendMessage(GROUP_CHAT_ID_2, `${username} has opted out and been removed from the queue.`);
     await askNextInQueue(laptopId, groupType);
     return;
   }
@@ -729,33 +838,39 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   if (data === "stasis_menu") {
-    return bot.sendMessage(userId, "📦 Stasis — deploy a laptop to a group:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "➡️ Send to Normal Group", callback_data: "stasis_to_normal" }],
-          [{ text: "➡️ Send to Expert Group", callback_data: "stasis_to_expert" }],
-          cancelButton
-        ]
-      }
-    });
+    const customGroups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+    const buttons = [
+      [{ text: "➡️ Send to Normal Group", callback_data: "stasis_to_normal" }],
+      [{ text: "➡️ Send to Expert Group", callback_data: "stasis_to_expert" }],
+      ...customGroups.map(cg => ([{ text: `➡️ Send to ${cg.name}`, callback_data: `stasis_to_cg_${cg.id}` }])),
+      cancelButton
+    ];
+    return bot.sendMessage(userId, "📦 Stasis — deploy a laptop to a group:", { reply_markup: { inline_keyboard: buttons } });
   }
 
-  if (data === "stasis_to_normal" || data === "stasis_to_expert") {
-    const targetGroup = data === "stasis_to_normal" ? "normal" : "expert";
+  if (data === "stasis_to_normal" || data === "stasis_to_expert" || data.startsWith("stasis_to_cg_")) {
+    let targetGroup;
+    if (data === "stasis_to_normal") targetGroup = "normal";
+    else if (data === "stasis_to_expert") targetGroup = "expert";
+    else targetGroup = `cg_${data.replace("stasis_to_cg_", "")}`;
+    const groupLabel = await getGroupName(targetGroup);
     const stasisLaptops = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
     if (!stasisLaptops.length) { await bot.sendMessage(userId, "📭 No laptops in stasis."); return sendAdminPanel(userId); }
     const buttons = stasisLaptops.map(l => ([{ text: l.name, callback_data: `deploy_${targetGroup}_${l.id}` }]));
     buttons.push(cancelButton);
-    return bot.sendMessage(userId, `Select a laptop to deploy to ${targetGroup} group:`, { reply_markup: { inline_keyboard: buttons } });
+    return bot.sendMessage(userId, `Select a laptop to deploy to ${groupLabel}:`, { reply_markup: { inline_keyboard: buttons } });
   }
 
   if (data.startsWith("deploy_")) {
-    const parts = data.split("_");
-    const targetGroup = parts[1];
-    const laptopId = parseInt(parts[2]);
+    // Format: deploy_<groupType>_<laptopId> — groupType may contain underscores (cg_1)
+    const withoutPrefix = data.replace("deploy_", "");
+    const lastUnder = withoutPrefix.lastIndexOf("_");
+    const targetGroup = withoutPrefix.substring(0, lastUnder);
+    const laptopId = parseInt(withoutPrefix.substring(lastUnder + 1));
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
+    const groupLabel = await getGroupName(targetGroup);
     await db().run(`UPDATE laptops SET status = 'available', group_type = ? WHERE id = ?`, [targetGroup, laptopId]);
-    await bot.sendMessage(userId, `✅ ${laptop.name} deployed to ${targetGroup} group.`);
+    await bot.sendMessage(userId, `✅ ${laptop.name} deployed to ${groupLabel}.`);
     const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [targetGroup]);
     if (queueCount.count > 0) await askNextInQueue(laptopId, targetGroup);
     return sendAdminPanel(userId);
@@ -831,17 +946,60 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   if (data === "transfer_menu") {
-    return bot.sendMessage(userId, "🔄 Transfer laptops between groups:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Expert ➡️ Normal", callback_data: "transfer_e2n" }],
-          [{ text: "Normal ➡️ Expert", callback_data: "transfer_n2e" }],
-          cancelButton
-        ]
-      }
-    });
+    const customGroups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+    const buttons = [
+      [{ text: "Normal Group", callback_data: "transfer_from_normal" }],
+      [{ text: "Expert Group", callback_data: "transfer_from_expert" }],
+      ...customGroups.map(cg => ([{ text: cg.name, callback_data: `transfer_from_cg_${cg.id}` }])),
+      cancelButton
+    ];
+    return bot.sendMessage(userId, "🔄 Transfer — select source group:", { reply_markup: { inline_keyboard: buttons } });
   }
 
+  if (data.startsWith("transfer_from_")) {
+    const fromPart = data.replace("transfer_from_", "");
+    let fromGroup;
+    if (fromPart === "normal") fromGroup = "normal";
+    else if (fromPart === "expert") fromGroup = "expert";
+    else fromGroup = `cg_${fromPart.replace("cg_", "")}`;
+    const fromLabel = await getGroupName(fromGroup);
+    const customGroups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+    const buttons = [];
+    if (fromGroup !== "normal") buttons.push([{ text: "Normal Group", callback_data: `transfer_to_normal_${fromGroup}` }]);
+    if (fromGroup !== "expert") buttons.push([{ text: "Expert Group", callback_data: `transfer_to_expert_${fromGroup}` }]);
+    for (const cg of customGroups) {
+      if (fromGroup !== `cg_${cg.id}`) {
+        buttons.push([{ text: cg.name, callback_data: `transfer_to_cg_${cg.id}_${fromGroup}` }]);
+      }
+    }
+    buttons.push(cancelButton);
+    return bot.sendMessage(userId, `🔄 Transfer from ${fromLabel} — select destination:`, { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  if (data.startsWith("transfer_to_")) {
+    const withoutPrefix = data.replace("transfer_to_", "");
+    let toGroup, fromGroup;
+    if (withoutPrefix.startsWith("normal_")) { toGroup = "normal"; fromGroup = withoutPrefix.replace("normal_", ""); }
+    else if (withoutPrefix.startsWith("expert_")) { toGroup = "expert"; fromGroup = withoutPrefix.replace("expert_", ""); }
+    else {
+      // transfer_to_cg_X_fromGroup — parse carefully
+      const match = withoutPrefix.match(/^cg_(\d+)_(.+)$/);
+      if (!match) return sendAdminPanel(userId);
+      toGroup = `cg_${match[1]}`;
+      fromGroup = match[2];
+    }
+    const fromLabel = await getGroupName(fromGroup);
+    const toLabel = await getGroupName(toGroup);
+    const laptops = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [fromGroup]);
+    if (!laptops.length) { await bot.sendMessage(userId, `📭 No available laptops in ${fromLabel}.`); return sendAdminPanel(userId); }
+    adminState[userId] = { action: "transferring", fromGroup, toGroup, selected: [] };
+    const buttons = laptops.map(l => ([{ text: l.name, callback_data: `tselect_${l.id}` }]));
+    buttons.push([{ text: "✅ Confirm Transfer", callback_data: "transfer_confirm" }]);
+    buttons.push(cancelButton);
+    return bot.sendMessage(userId, `Select laptops to transfer from ${fromLabel} to ${toLabel}:\n\nSelected: none`, { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  // Legacy direct transfer callbacks (kept for safety)
   if (data === "transfer_e2n" || data === "transfer_n2e") {
     const fromGroup = data === "transfer_e2n" ? "expert" : "normal";
     const toGroup = data === "transfer_e2n" ? "normal" : "expert";
@@ -884,10 +1042,13 @@ bot.on("callback_query", async (callbackQuery) => {
       const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [toGroup]);
       if (queueCount.count > 0) await askNextInQueue(laptopId, toGroup);
     }
-    const targetGroupId = toGroup === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
-    await bot.sendMessage(targetGroupId, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
-    if (toGroup !== "expert") await bot.sendMessage(GROUP_CHAT_ID_2, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
-    await bot.sendMessage(userId, `✅ Transferred ${names.join(", ")} to ${toGroup} group.`);
+    const targetGroupId = await getGroupChatId(toGroup);
+    const toLabel = await getGroupName(toGroup);
+    if (targetGroupId) {
+      await bot.sendMessage(targetGroupId, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
+      if (toGroup === "normal") await bot.sendMessage(GROUP_CHAT_ID_2, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
+    }
+    await bot.sendMessage(userId, `✅ Transferred ${names.join(", ")} to ${toLabel} group.`);
     return sendAdminPanel(userId);
   }
 
@@ -1112,6 +1273,66 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 
   // ── CLEAR QUEUE ──
+  // ── GROUP MANAGEMENT ──
+  if (data === "group_management") {
+    const groups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+    let msg = "👥 *Group Management*\n\n";
+    if (groups.length) {
+      msg += groups.map(g => `• ${escapeMarkdown(g.name)} (Chat ID: \`${g.chat_id}\`)`).join("\n");
+    } else {
+      msg += "No custom groups yet.";
+    }
+    return bot.sendMessage(userId, msg, {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "➕ Add New Group", callback_data: "group_add" }],
+          [{ text: "🗑 Remove Group", callback_data: "group_remove" }],
+          cancelButton
+        ]
+      }
+    });
+  }
+
+  if (data === "group_add") {
+    adminState[userId] = { action: "awaiting_group_name" };
+    return bot.sendMessage(userId, "📝 Enter a name for the new group:", { reply_markup: { inline_keyboard: [cancelButton] } });
+  }
+
+  if (data === "group_remove") {
+    const groups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+    if (!groups.length) { await bot.sendMessage(userId, "📭 No custom groups to remove."); return sendAdminPanel(userId); }
+    const buttons = groups.map(g => ([{ text: `🗑 ${g.name}`, callback_data: `group_delete_${g.id}` }]));
+    buttons.push(cancelButton);
+    return bot.sendMessage(userId, "Select a group to remove:", { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  if (data.startsWith("group_delete_") && !data.startsWith("group_confirm_delete_")) {
+    const groupId = parseInt(data.replace("group_delete_", ""));
+    const group = await db().get(`SELECT * FROM custom_groups WHERE id = ?`, [groupId]);
+    if (!group) { await bot.sendMessage(userId, "⚠️ Group not found."); return sendAdminPanel(userId); }
+    return bot.sendMessage(userId, `⚠️ Remove group "${group.name}"?\n\nAll laptops in this group will be moved to stasis and the queue will be cleared.`, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Yes, Remove", callback_data: `group_confirm_delete_${groupId}` },
+          { text: "❌ Cancel", callback_data: "cancel" }
+        ]]
+      }
+    });
+  }
+
+  if (data.startsWith("group_confirm_delete_")) {
+    const groupId = parseInt(data.replace("group_confirm_delete_", ""));
+    const group = await db().get(`SELECT * FROM custom_groups WHERE id = ?`, [groupId]);
+    if (!group) { await bot.sendMessage(userId, "⚠️ Group not found."); return sendAdminPanel(userId); }
+    const groupType = `cg_${groupId}`;
+    await db().run(`UPDATE laptops SET status = 'stasis', group_type = 'stasis', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE group_type = ?`, [groupType]);
+    await db().run(`DELETE FROM queue WHERE group_type = ?`, [groupType]);
+    await db().run(`DELETE FROM custom_groups WHERE id = ?`, [groupId]);
+    await bot.sendMessage(userId, `✅ Group "${group.name}" removed. All laptops moved to stasis.`);
+    return sendAdminPanel(userId);
+  }
+
   if (data === "clear_queue") {
     return bot.sendMessage(userId, "⚠️ Are you sure you want to clear the entire queue? This cannot be undone.", {
       reply_markup: {

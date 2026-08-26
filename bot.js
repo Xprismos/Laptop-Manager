@@ -1169,50 +1169,26 @@ bot.on("callback_query", async (callbackQuery) => {
 
   // ── STATUS ──
   if (data === "status") {
-    const customGroups = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
-    const buttons = [
-      [{ text: "💻 Normal", callback_data: "status_normal" }],
-      [{ text: "🎓 Expert", callback_data: "status_expert" }],
-      [{ text: "🔌 Offline", callback_data: "status_offline" }],
-      [{ text: "📦 Stasis", callback_data: "status_stasis" }],
-      ...customGroups.map(cg => ([{ text: `👥 ${cg.name}`, callback_data: `status_cg_${cg.id}` }])),
-      cancelButton
-    ];
-    return bot.sendMessage(userId, "📊 Select a group to view:", { reply_markup: { inline_keyboard: buttons } });
-  }
-
-  if (data.startsWith("status_")) {
-    const target = data.replace("status_", "");
-    let msg = "";
-
-    if (target === "offline") {
-      const laptops = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
-      msg = `🔌 Offline (${laptops.length})\n\n`;
-      msg += laptops.length ? laptops.map((l, i) => `${i + 1}. ${l.name}`).join("\n") : "None";
-    } else if (target === "stasis") {
-      const laptops = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
-      msg = `📦 Stasis (${laptops.length})\n\n`;
-      msg += laptops.length ? laptops.map((l, i) => `${i + 1}. ${l.name}`).join("\n") : "None";
-    } else {
-      let groupType, label;
-      if (target === "normal") { groupType = "normal"; label = "💻 Normal"; }
-      else if (target === "expert") { groupType = "expert"; label = "🎓 Expert"; }
-      else {
-        const cgId = parseInt(target.replace("cg_", ""));
-        const cg = await db().get(`SELECT * FROM custom_groups WHERE id = ?`, [cgId]);
-        groupType = `cg_${cgId}`;
-        label = cg ? `👥 ${cg.name}` : groupType;
-      }
-      const assigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = ?`, [groupType]);
-      const available = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [groupType]);
-      msg = `${label}\n\n`;
-      msg += `✅ Available (${available.length}):\n`;
-      msg += available.length ? available.map((l, i) => `${i + 1}. ${l.name}`).join("\n") : "None";
-      msg += `\n\n🔒 Assigned (${assigned.length}):\n`;
-      msg += assigned.length ? assigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") : "None";
-    }
-
-    await bot.sendMessage(userId, msg);
+    const normalAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'normal'`);
+    const expertAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = 'expert'`);
+    const normalAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'normal'`);
+    const expertAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`);
+    const stasis          = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
+    const offline         = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
+    let statusMsg = "📊 LAPTOP STATUS\n\n";
+    statusMsg += "💻 Normal — Assigned:\n";
+    statusMsg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n💻 Expert — Assigned:\n";
+    statusMsg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n✅ Normal — Available:\n";
+    statusMsg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n✅ Expert — Available:\n";
+    statusMsg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n📦 In Stasis:\n";
+    statusMsg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n🔌 Offline:\n";
+    statusMsg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    await bot.sendMessage(userId, statusMsg);
     return sendAdminPanel(userId);
   }
 

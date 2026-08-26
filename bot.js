@@ -1175,19 +1175,33 @@ bot.on("callback_query", async (callbackQuery) => {
     const expertAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = 'expert'`);
     const stasis          = await db().all(`SELECT * FROM laptops WHERE status = 'stasis'`);
     const offline         = await db().all(`SELECT * FROM laptops WHERE status = 'offline'`);
+    const customGroups    = await db().all(`SELECT * FROM custom_groups ORDER BY id ASC`);
+
     let statusMsg = "📊 LAPTOP STATUS\n\n";
     statusMsg += "💻 Normal — Assigned:\n";
     statusMsg += normalAssigned.length ? normalAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
-    statusMsg += "\n💻 Expert — Assigned:\n";
-    statusMsg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
     statusMsg += "\n✅ Normal — Available:\n";
     statusMsg += normalAvailable.length ? normalAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    statusMsg += "\n🎓 Expert — Assigned:\n";
+    statusMsg += expertAssigned.length ? expertAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
     statusMsg += "\n✅ Expert — Available:\n";
     statusMsg += expertAvailable.length ? expertAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+
+    for (const cg of customGroups) {
+      const groupType = `cg_${cg.id}`;
+      const cgAssigned  = await db().all(`SELECT * FROM laptops WHERE status = 'assigned' AND group_type = ?`, [groupType]);
+      const cgAvailable = await db().all(`SELECT * FROM laptops WHERE status = 'available' AND group_type = ?`, [groupType]);
+      statusMsg += `\n👥 ${cg.name} — Assigned:\n`;
+      statusMsg += cgAssigned.length ? cgAssigned.map((l, i) => `${i + 1}. ${l.name} → ${l.assigned_username || `User ${l.assigned_to}`} (${formatLogTime(l.assigned_at)})`).join("\n") + "\n" : "None\n";
+      statusMsg += `\n✅ ${cg.name} — Available:\n`;
+      statusMsg += cgAvailable.length ? cgAvailable.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+    }
+
     statusMsg += "\n📦 In Stasis:\n";
     statusMsg += stasis.length ? stasis.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
     statusMsg += "\n🔌 Offline:\n";
     statusMsg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
+
     await bot.sendMessage(userId, statusMsg);
     return sendAdminPanel(userId);
   }

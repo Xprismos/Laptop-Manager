@@ -12,6 +12,7 @@ const GROUP_CHAT_ID_2 = -1003657694389;
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_HELP_GROUP_ID = -1003970027998;
 const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121, 8635686304, 6633566032];
+const SUPER_ADMIN_IDS = [2117559048]; // Add super admin user IDs here
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
@@ -26,6 +27,16 @@ const cancelButton = [{ text: "🚫 Cancel", callback_data: "cancel" }];
       name TEXT NOT NULL UNIQUE,
       chat_id INTEGER NOT NULL UNIQUE,
       created_at TEXT NOT NULL
+    )
+  `);
+  await db().run(`
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      admin_id INTEGER NOT NULL,
+      admin_username TEXT,
+      action TEXT NOT NULL,
+      details TEXT,
+      timestamp TEXT NOT NULL
     )
   `);
   console.log("🤖 Bot running");
@@ -123,8 +134,41 @@ function formatLogTime(iso) {
   return d.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true });
 }
 
+async function logAdminAction(adminId, adminUsername, action, details = "") {
+  await db().run(
+    `INSERT INTO admin_logs (admin_id, admin_username, action, details, timestamp) VALUES (?, ?, ?, ?, ?)`,
+    [adminId, adminUsername || `User ${adminId}`, action, details, new Date().toISOString()]
+  );
+}
+
+async function sendAuditResults(userId, logs, rangeLabel) {
+  if (!logs.length) {
+    await bot.sendMessage(userId, `📜 No activity found for ${rangeLabel}.`);
+    return sendAdminPanel(userId);
+  }
+  const lines = logs.map(l => {
+    const time = formatLogTime(l.timestamp);
+    return `🕐 ${time}\n📌 ${l.action}${l.details ? `\n📝 ${l.details}` : ""}`;
+  });
+  // Split into chunks if too long for one message
+  const chunks = [];
+  let current = `📜 Audit Log — ${rangeLabel}\n\n`;
+  for (const line of lines) {
+    if ((current + line + "\n\n").length > 3800) {
+      chunks.push(current);
+      current = `📜 (continued)\n\n`;
+    }
+    current += line + "\n\n";
+  }
+  chunks.push(current);
+  for (const chunk of chunks) await bot.sendMessage(userId, chunk);
+  return sendAdminPanel(userId);
+}
+
 async function sendAdminPanel(targetId) {
   try {
+    const isSuperAdmin = SUPER_ADMIN_IDS.includes(targetId);
+    const extraButtons = isSuperAdmin ? [[{ text: "📜 Audit Log", callback_data: "audit_log" }]] : [];
     await bot.sendMessage(targetId, "🛠 Admin Panel", {
       reply_markup: {
         inline_keyboard: [
@@ -140,7 +184,8 @@ async function sendAdminPanel(targetId) {
           [{ text: "📋 Laptop Logs", callback_data: "logs_menu" }],
           [{ text: "🕐 24h Workers", callback_data: "logs_24h" }],
           [{ text: "👥 Group Management", callback_data: "group_management" }],
-          [{ text: "🗑 Clear Queue", callback_data: "clear_queue" }]
+          [{ text: "🗑 Clear Queue", callback_data: "clear_queue" }],
+          ...extraButtons
         ]
       }
     });
@@ -424,6 +469,7 @@ await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
       delete adminState[userId];
       await db().run(`INSERT INTO laptops (name, status, group_type) VALUES (?, 'stasis', 'stasis')`, [laptopName]);
       await bot.sendMessage(userId, `✅ ${escapeMarkdown(laptopName)} added to stasis.`);
+      await logAdminAction(userId, username, "Add Laptop", laptopName);
       await sendAdminPanel(userId);
       return;
     }
@@ -510,6 +556,23 @@ await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
       return bot.sendMessage(userId, `Select the laptop to link:`, { reply_markup: { inline_keyboard: buttons } });
     }
 
+    if (adminState[userId].action === "awaiting_audit_date") {
+      if (!SUPER_ADMIN_IDS.includes(userId)) return;
+      const { targetAdminId } = adminState[userId];
+      delete adminState[userId];
+      const dateInput = text.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
+        return bot.sendMessage(userId, "⚠️ Invalid format. Please use YYYY-MM-DD (e.g. 2026-07-18).");
+      }
+      const fromDate = new Date(dateInput).toISOString();
+      const toDate = new Date(new Date(dateInput).getTime() + 24 * 60 * 60 * 1000).toISOString();
+      const logs = await db().all(
+        `SELECT * FROM admin_logs WHERE admin_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC`,
+        [targetAdminId, fromDate, toDate]
+      );
+      return sendAuditResults(userId, logs, dateInput);
+    }
+
     if (adminState[userId].action === "awaiting_group_name") {
       const groupName = text.trim();
       delete adminState[userId];
@@ -537,8 +600,10 @@ await bot.sendMessage(ADMIN_HELP_GROUP_ID, helpMsg, { parse_mode: "HTML" });
       try {
         await bot.sendMessage(chatIdInput, `✅ Laptop Manager is now active in this group. Workers can request laptops using the buttons below.`, expertKeyboard);
         await bot.sendMessage(userId, `✅ Group "${groupName}" added and verified! The bot sent a confirmation message to the group.`);
+        await logAdminAction(userId, username, "Add Group", groupName);
       } catch (e) {
         await bot.sendMessage(userId, `⚠️ Group "${groupName}" was saved but the bot couldn't send a message to it.\n\nMake sure the bot has been added to the group first.\n\nError: ${e.message}`);
+        await logAdminAction(userId, username, "Add Group (unverified)", groupName);
       }
       return sendAdminPanel(userId);
     }
@@ -870,6 +935,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const groupLabel = await getGroupName(targetGroup);
     await db().run(`UPDATE laptops SET status = 'available', group_type = ? WHERE id = ?`, [targetGroup, laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} deployed to ${groupLabel}.`);
+    await logAdminAction(userId, username, "Deploy Laptop", `${laptop.name} → ${groupLabel}`);
     const queueCount = await db().get(`SELECT COUNT(*) as count FROM queue WHERE group_type = ?`, [targetGroup]);
     if (queueCount.count > 0) await askNextInQueue(laptopId, targetGroup);
     return sendAdminPanel(userId);
@@ -891,6 +957,7 @@ bot.on("callback_query", async (callbackQuery) => {
     }
     await db().run(`UPDATE laptops SET status = 'stasis', group_type = 'stasis', assigned_to = NULL, assigned_username = NULL, assigned_at = NULL WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} has been put in stasis.`);
+    await logAdminAction(userId, username, "Remove Laptop", laptop.name);
     return sendAdminPanel(userId);
   }
 
@@ -1048,6 +1115,7 @@ bot.on("callback_query", async (callbackQuery) => {
       if (toGroup === "normal") await bot.sendMessage(GROUP_CHAT_ID_2, `🔄 The following laptops have been transferred to this group: ${names.join(", ")}`);
     }
     await bot.sendMessage(userId, `✅ Transferred ${names.join(", ")} to ${toLabel} group.`);
+    await logAdminAction(userId, username, "Transfer", `${names.join(", ")} → ${toLabel}`);
     return sendAdminPanel(userId);
   }
 
@@ -1109,6 +1177,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const targetGroupId = userGroupType === "expert" ? EXPERT_GROUP_CHAT_ID : GROUP_CHAT_ID;
     await assignLaptopToUser(laptop, targetUserId, targetUsername, targetGroupId);
     await bot.sendMessage(userId, `✅ ${targetUsername} force assigned to ${laptop.name}.`);
+    await logAdminAction(userId, username, "Force Assign", `${targetUsername} → ${laptop.name}`);
     return sendAdminPanel(userId);
   }
 
@@ -1164,6 +1233,7 @@ bot.on("callback_query", async (callbackQuery) => {
     }
     await db().run(`DELETE FROM laptops WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ ${laptop.name} has been deleted.`);
+    await logAdminAction(userId, username, "Delete Laptop", laptop.name);
     return sendAdminPanel(userId);
   }
 
@@ -1343,6 +1413,7 @@ bot.on("callback_query", async (callbackQuery) => {
     await db().run(`DELETE FROM queue WHERE group_type = ?`, [groupType]);
     await db().run(`DELETE FROM custom_groups WHERE id = ?`, [groupId]);
     await bot.sendMessage(userId, `✅ Group "${group.name}" removed. All laptops moved to stasis.`);
+    await logAdminAction(userId, username, "Remove Group", group.name);
     return sendAdminPanel(userId);
   }
 
@@ -1358,13 +1429,13 @@ bot.on("callback_query", async (callbackQuery) => {
 
   if (data === "clear_queue_confirm") {
     await db().run(`DELETE FROM queue`);
-    // Cancel all pending checks
     for (const uid of Object.keys(pendingChecks)) {
       clearTimeout(pendingChecks[uid].timeout);
       delete pendingChecks[uid];
       delete missedChecks[uid];
     }
     await bot.sendMessage(userId, "✅ Queue has been cleared.");
+    await logAdminAction(userId, username, "Clear Queue", "All queues cleared");
     return sendAdminPanel(userId);
   }
 
@@ -1428,6 +1499,7 @@ bot.on("callback_query", async (callbackQuery) => {
     const online = l.rustdesk_id && relay.isConnected(l.rustdesk_id) ? "🟢" : "🔴";
     const msg = `${online} *${escapeMarkdown(l.name)}*\nID: \`${l.rustdesk_id || "not linked"}\`\nPassword: \`${l.rustdesk_password || "unknown"}\``;
     await bot.sendMessage(userId, msg, { parse_mode: "Markdown" });
+    await logAdminAction(userId, username, "View Password", l.name);
     return sendAdminPanel(userId);
   }
 
@@ -1527,6 +1599,7 @@ if (data === "sec_link_agent") {
       `✅ Agent \`${rustdesk_id}\` linked to *${escapeMarkdown(laptop.name)}*.\n\nNow activate advanced security from the Security menu.`,
       { parse_mode: "Markdown" }
     );
+    await logAdminAction(userId, username, "Link Agent", `${rustdesk_id} → ${laptop.name}`);
     return sendAdminPanel(userId);
   }
 
@@ -1557,6 +1630,7 @@ if (data === "sec_link_agent") {
         `✅ Handshake successful!\n\n🔐 Advanced security activated for *${escapeMarkdown(laptop.name)}*.\n\nFrom now on, users assigned this laptop will receive RustDesk credentials via DM.`,
         { parse_mode: "Markdown" }
       );
+      await logAdminAction(userId, username, "Activate Security", laptop.name);
     } catch (err) {
       await bot.sendMessage(userId, `❌ Handshake failed for ${escapeMarkdown(laptop.name)}: ${err.message}\n\nCheck the agent is running correctly.`);
     }
@@ -1573,7 +1647,81 @@ if (data === "sec_link_agent") {
     const laptop = await db().get(`SELECT * FROM laptops WHERE id = ?`, [laptopId]);
     await db().run(`UPDATE laptops SET advanced_security = 0 WHERE id = ?`, [laptopId]);
     await bot.sendMessage(userId, `✅ Advanced security deactivated for *${escapeMarkdown(laptop.name)}*. It will now operate normally.`, { parse_mode: "Markdown" });
+    await logAdminAction(userId, username, "Deactivate Security", laptop.name);
     return sendAdminPanel(userId);
+  }
+
+  // ── AUDIT LOG (super admins only) ──
+  if (data === "audit_log") {
+    if (!SUPER_ADMIN_IDS.includes(userId)) return;
+    const admins = await db().all(
+      `SELECT DISTINCT admin_id, admin_username FROM admin_logs ORDER BY admin_username ASC`
+    );
+    if (!admins.length) {
+      await bot.sendMessage(userId, "📜 No admin activity logged yet.");
+      return sendAdminPanel(userId);
+    }
+    const buttons = admins.map(a => ([{ text: `@${a.admin_username || `User ${a.admin_id}`}`, callback_data: `auditadmin_${a.admin_id}` }]));
+    buttons.push(cancelButton);
+    return bot.sendMessage(userId, "📜 Audit Log — select an admin:", { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  if (data.startsWith("auditadmin_")) {
+    if (!SUPER_ADMIN_IDS.includes(userId)) return;
+    const targetAdminId = parseInt(data.replace("auditadmin_", ""));
+    const admin = await db().get(`SELECT admin_username FROM admin_logs WHERE admin_id = ? LIMIT 1`, [targetAdminId]);
+    const adminLabel = admin ? `@${admin.admin_username}` : `User ${targetAdminId}`;
+    return bot.sendMessage(userId, `📜 ${adminLabel} — select time range:`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "Today", callback_data: `auditrange_today_${targetAdminId}` }],
+          [{ text: "Yesterday", callback_data: `auditrange_yesterday_${targetAdminId}` }],
+          [{ text: "Past 7 Days", callback_data: `auditrange_7days_${targetAdminId}` }],
+          [{ text: "Past 14 Days", callback_data: `auditrange_14days_${targetAdminId}` }],
+          [{ text: "📅 Pick a Date", callback_data: `auditrange_pickdate_${targetAdminId}` }],
+          cancelButton
+        ]
+      }
+    });
+  }
+
+  if (data.startsWith("auditrange_")) {
+    if (!SUPER_ADMIN_IDS.includes(userId)) return;
+    const withoutPrefix = data.replace("auditrange_", "");
+    const lastUnder = withoutPrefix.lastIndexOf("_");
+    const range = withoutPrefix.substring(0, lastUnder);
+    const targetAdminId = parseInt(withoutPrefix.substring(lastUnder + 1));
+
+    if (range === "pickdate") {
+      adminState[userId] = { action: "awaiting_audit_date", targetAdminId };
+      return bot.sendMessage(userId, "📅 Enter a date (YYYY-MM-DD):", { reply_markup: { inline_keyboard: [cancelButton] } });
+    }
+
+    const now = new Date();
+    let fromDate;
+    if (range === "today") {
+      fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    } else if (range === "yesterday") {
+      const y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      fromDate = y.toISOString();
+      const toDate = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+      const logs = await db().all(
+        `SELECT * FROM admin_logs WHERE admin_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC`,
+        [targetAdminId, fromDate, toDate]
+      );
+      return sendAuditResults(userId, logs, `Yesterday`);
+    } else if (range === "7days") {
+      fromDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    } else if (range === "14days") {
+      fromDate = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    const logs = await db().all(
+      `SELECT * FROM admin_logs WHERE admin_id = ? AND timestamp >= ? ORDER BY timestamp ASC`,
+      [targetAdminId, fromDate]
+    );
+    const rangeLabel = range === "today" ? "Today" : range === "7days" ? "Past 7 Days" : "Past 14 Days";
+    return sendAuditResults(userId, logs, rangeLabel);
   }
 
 });

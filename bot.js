@@ -12,7 +12,7 @@ const GROUP_CHAT_ID_2 = -1003657694389;
 const EXPERT_GROUP_CHAT_ID = parseInt(process.env.EXPERT_GROUP_CHAT_ID);
 const ADMIN_HELP_GROUP_ID = -1003970027998;
 const ADMIN_IDS = [2117559048, 6466671056, 1911312334, 1532807099, 1248799247, 1302705638, 1325958049, 1248799247, 8526365759, 1046218147, 5448140589, 912497121, 8635686304, 6633566032];
-const SUPER_ADMIN_IDS = [2117559048, 1302705638]; // Add super admin user IDs here
+const SUPER_ADMIN_IDS = [2117559048]; // Add super admin user IDs here
 const pendingChecks = {};
 const missedChecks = {};
 const adminState = {};
@@ -1272,7 +1272,18 @@ bot.on("callback_query", async (callbackQuery) => {
     statusMsg += "\n🔌 Offline:\n";
     statusMsg += offline.length ? offline.map((l, i) => `${i + 1}. ${l.name}`).join("\n") + "\n" : "None\n";
 
-    await bot.sendMessage(userId, statusMsg);
+    // Split into chunks if message exceeds Telegram's 4096 char limit
+    const chunks = [];
+    let current = "";
+    for (const line of statusMsg.split("\n")) {
+      if ((current + line + "\n").length > 3800) {
+        chunks.push(current);
+        current = "";
+      }
+      current += line + "\n";
+    }
+    if (current) chunks.push(current);
+    for (const chunk of chunks) await bot.sendMessage(userId, chunk);
     return sendAdminPanel(userId);
   }
 
